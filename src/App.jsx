@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { supabase } from './lib/supabase';
 import Map from './components/Map';
 import VehicleProfile from './components/VehicleProfile';
+import RouteSearch from './components/RouteSearch';
 import Auth from './Auth';
 
 function App() {
@@ -22,15 +23,22 @@ function App() {
     return () => subscription?.unsubscribe();
   }, []);
 
+  const handleRouteSearch = ({ start, end }) => {
+    console.log('Searching route from', start, 'to', end, 'with profile:', profile);
+  };
+
   if (loading) return <div>Loading...</div>;
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
-      <Map profile={profile} />
-      {user ? (
-        <VehicleProfile onProfileUpdate={setProfile} />
+      {!user ? (
+        <Auth onAuthChange={() => setUser(true)} />
       ) : (
-        <Auth onAuthChange={() => {}} />
+        <>
+          <Map profile={profile} />
+          <RouteSearch onSearch={handleRouteSearch} profile={profile} />
+          <VehicleProfile onProfileUpdate={setProfile} />
+        </>
       )}
     </div>
   );
