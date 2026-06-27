@@ -26,6 +26,8 @@ const Map = ({ profile }) => {
   const endInteractingRef = useRef(false);
   const startRequestId = useRef(0);
   const endRequestId = useRef(0);
+  const startResolvedRef = useRef(null);
+  const endResolvedRef = useRef(null);
   const [startLocation, setStartLocation] = useState('');
   const [endLocation, setEndLocation] = useState('');
   const [startSuggestions, setStartSuggestions] = useState([]);
@@ -84,18 +86,21 @@ const Map = ({ profile }) => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const geocode = (query) => new Promise((resolve, reject) => {
-    platformRef.current.getSearchService().geocode({ q: query, in: 'countryCode:CAN' }, (result) => {
-      result.items?.length > 0
-        ? resolve({ lat: result.items[0].position.lat, lng: result.items[0].position.lng })
-        : reject(new Error(`Location not found: ${query}`));
-    }, reject);
+  // Autosuggest (not Geocode) so business names/landmarks like "Canadian Tire
+  // Motorsport Park" resolve, not just structured street addresses.
+  const resolveLocation = (query) => new Promise((resolve, reject) => {
+    platformRef.current.getSearchService().autosuggest({
+      q: query,
+      in: 'countryCode:CAN',
+      at: '56.1304,-106.3468',
+      limit: 5
+    }, (result) => {
+      const match = (result.items || []).find((item) => item.position);
+      match ? resolve({ lat: match.position.lat, lng: match.position.lng }) : reject(new Error(`Location not found: ${query}`));
+    }, () => reject(new Error(`Location not found: ${query}`)));
   });
 
-  const formatSuggestion = (item) => {
-    const region = item.address?.stateCode || item.address?.state || '';
-    return region ? `${item.title}, ${region}` : item.title;
-  };
+  const formatSuggestion = (item) => item.title.replace(/,\s*Canada$/i, '');
 
   const fetchSuggestions = (query, setSuggestions, setLoading, requestIdRef) => {
     const myRequestId = ++requestIdRef.current;
@@ -108,6 +113,7 @@ const Map = ({ profile }) => {
     platformRef.current.getSearchService().autosuggest({
       q: query,
       in: 'countryCode:CAN',
+      at: '56.1304,-106.3468',
       limit: 5
     }, (result) => {
       if (requestIdRef.current !== myRequestId) return;
@@ -123,6 +129,7 @@ const Map = ({ profile }) => {
   const handleStartChange = (e) => {
     const value = e.target.value;
     setStartLocation(value);
+    if (startResolvedRef.current?.text !== value) startResolvedRef.current = null;
     clearTimeout(startSuggestTimeout.current);
     startSuggestTimeout.current = setTimeout(() => {
       fetchSuggestions(value, setStartSuggestions, setStartSuggestLoading, startRequestId);
@@ -132,6 +139,7 @@ const Map = ({ profile }) => {
   const handleEndChange = (e) => {
     const value = e.target.value;
     setEndLocation(value);
+    if (endResolvedRef.current?.text !== value) endResolvedRef.current = null;
     clearTimeout(endSuggestTimeout.current);
     endSuggestTimeout.current = setTimeout(() => {
       fetchSuggestions(value, setEndSuggestions, setEndSuggestLoading, endRequestId);
@@ -139,12 +147,16 @@ const Map = ({ profile }) => {
   };
 
   const selectStartSuggestion = (item) => {
-    setStartLocation(formatSuggestion(item));
+    const text = formatSuggestion(item);
+    setStartLocation(text);
+    startResolvedRef.current = { text, position: { lat: item.position.lat, lng: item.position.lng } };
     setStartSuggestions([]);
   };
 
   const selectEndSuggestion = (item) => {
-    setEndLocation(formatSuggestion(item));
+    const text = formatSuggestion(item);
+    setEndLocation(text);
+    endResolvedRef.current = { text, position: { lat: item.position.lat, lng: item.position.lng } };
     setEndSuggestions([]);
   };
 
@@ -232,7 +244,12 @@ const Map = ({ profile }) => {
     setError('');
     setRouteInfo(null);
     try {
-      const [start, end] = await Promise.all([geocode(startLocation), geocode(endLocation)]);
+      const resolve = (location, resolvedRef) =>
+        resolvedRef.current?.text === location ? Promise.resolve(resolvedRef.current.position) : resolveLocation(location);
+      const [start, end] = await Promise.all([
+        resolve(startLocation, startResolvedRef),
+        resolve(endLocation, endResolvedRef)
+      ]);
       const router = platformRef.current.getRoutingService(null, 8);
       router.calculateRoute({
         origin: `${start.lat},${start.lng}`,
