@@ -220,7 +220,9 @@ const Map = ({ profile, onNavigatingChange }) => {
   const lastIndexRef = useRef(0);
   const lastPositionRef = useRef(null);
   const recalculatingRef = useRef(false);
+  const routeStartRef = useRef(null);
   const routeEndRef = useRef(null);
+  const routeDropdownRef = useRef(null);
   const navSpansRef = useRef([]);
   const navCumulativeDurationRef = useRef([]);
   const navTotalLengthRef = useRef(0);
@@ -266,6 +268,14 @@ const Map = ({ profile, onNavigatingChange }) => {
   const [currentSpeedMps, setCurrentSpeedMps] = useState(null);
   const [currentSpeedLimitMps, setCurrentSpeedLimitMps] = useState(null);
   const [tripStats, setTripStats] = useState(null);
+  const [savedRoutes, setSavedRoutes] = useState([]);
+  const [showRouteDropdown, setShowRouteDropdown] = useState(false);
+  const [routeDropdownExpanded, setRouteDropdownExpanded] = useState(false);
+  const [routeSearchQuery, setRouteSearchQuery] = useState('');
+  const [showSaveRouteModal, setShowSaveRouteModal] = useState(false);
+  const [saveRouteName, setSaveRouteName] = useState('');
+  const [savingRoute, setSavingRoute] = useState(false);
+  const [saveRouteError, setSaveRouteError] = useState('');
 
   const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
 
@@ -333,6 +343,9 @@ const Map = ({ profile, onNavigatingChange }) => {
         setOptionsMenuOpen(false);
         setSpeedUnitMenuOpen(false);
       }
+      if (routeDropdownRef.current && !routeDropdownRef.current.contains(e.target)) {
+        setShowRouteDropdown(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
@@ -354,6 +367,26 @@ const Map = ({ profile, onNavigatingChange }) => {
         console.error('Failed to load speed unit preference:', err);
       }
     })();
+  }, []);
+
+  const fetchSavedRoutes = async () => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+      const { data, error } = await supabase
+        .from('saved_routes')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('last_used', { ascending: false, nullsFirst: false });
+      if (error) throw error;
+      setSavedRoutes(data || []);
+    } catch (err) {
+      console.error('Failed to load saved routes:', err);
+    }
+  };
+
+  useEffect(() => {
+    fetchSavedRoutes();
   }, []);
 
   // Re-checks the driver's country every few minutes while navigating so
@@ -631,24 +664,33 @@ const Map = ({ profile, onNavigatingChange }) => {
     }, (err) => reject(err));
   });
 
-  const calculateRoute = async () => {
+  // overrideStart/overrideEnd let a saved route load bypass component state
+  // entirely (setState is async, so state set moments earlier isn't visible
+  // yet to this closure) by supplying { text, position } directly.
+  const calculateRoute = async (overrideStart, overrideEnd) => {
     setStartSuggestions([]);
     setEndSuggestions([]);
-    if (!startLocation || !endLocation) {
+    const startText = overrideStart?.text ?? startLocation;
+    const endText = overrideEnd?.text ?? endLocation;
+    if (!startText || !endText) {
       setError('Enter start and end locations');
       return;
     }
+    if (overrideStart) setStartLocation(startText);
+    if (overrideEnd) setEndLocation(endText);
     setSearching(true);
     setError('');
     setRouteOptions([]);
     setSelectedRouteId(null);
     setProvincesOnRoute([]);
     try {
-      const resolve = (location, resolvedRef) =>
-        resolvedRef.current?.text === location ? Promise.resolve(resolvedRef.current.position) : resolveLocation(location);
+      const resolve = (location, resolvedRef, override) => {
+        if (override) return Promise.resolve(override.position);
+        return resolvedRef.current?.text === location ? Promise.resolve(resolvedRef.current.position) : resolveLocation(location);
+      };
       const [start, end] = await Promise.all([
-        resolve(startLocation, startResolvedRef),
-        resolve(endLocation, endResolvedRef)
+        resolve(startText, startResolvedRef, overrideStart),
+        resolve(endText, endResolvedRef, overrideEnd)
       ]);
       const router = platformRef.current.getRoutingService(null, 8);
       const baseParams = {
@@ -703,6 +745,7 @@ const Map = ({ profile, onNavigatingChange }) => {
           label: config.label,
           km,
           durationText: `${hours}h ${minutes}m`,
+          durationSeconds: section.summary.duration,
           hasTolls,
           polyline,
           bounds,
@@ -729,6 +772,7 @@ const Map = ({ profile, onNavigatingChange }) => {
       }, null);
       mapInstance.current.getViewModel().setLookAtData({ bounds: combinedBounds });
 
+      routeStartRef.current = { lat: start.lat, lng: start.lng };
       routeEndRef.current = { lat: end.lat, lng: end.lng };
       setRouteOptions(options);
       setSelectedRouteId(options[0].id);
@@ -738,6 +782,63 @@ const Map = ({ profile, onNavigatingChange }) => {
     } catch (err) {
       setError(err.message);
       setSearching(false);
+    }
+  };
+
+  const loadSavedRoute = async (route) => {
+    setShowRouteDropdown(false);
+    setRouteDropdownExpanded(false);
+    setRouteSearchQuery('');
+
+    const startOverride = { text: route.start_location, position: { lat: route.start_lat, lng: route.start_lng } };
+    const endOverride = { text: route.end_location, position: { lat: route.end_lat, lng: route.end_lng } };
+    startResolvedRef.current = startOverride;
+    endResolvedRef.current = endOverride;
+
+    await calculateRoute(startOverride, endOverride);
+
+    const updates = { load_count: (route.load_count || 0) + 1, last_used: new Date().toISOString() };
+    setSavedRoutes((prev) => prev.map((r) => (r.id === route.id ? { ...r, ...updates } : r)));
+    const { error: updateError } = await supabase.from('saved_routes').update(updates).eq('id', route.id);
+    if (updateError) console.error('Failed to update saved route usage:', updateError);
+  };
+
+  const handleSaveRoute = async () => {
+    const name = saveRouteName.trim();
+    if (!name) {
+      setSaveRouteError('Enter a name for this route');
+      return;
+    }
+    const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
+    if (!selected || !routeStartRef.current || !routeEndRef.current) return;
+
+    setSavingRoute(true);
+    setSaveRouteError('');
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('You must be signed in to save routes');
+      const { error: insertError } = await supabase.from('saved_routes').insert({
+        user_id: user.id,
+        route_name: name,
+        start_location: startLocation,
+        end_location: endLocation,
+        start_lat: routeStartRef.current.lat,
+        start_lng: routeStartRef.current.lng,
+        end_lat: routeEndRef.current.lat,
+        end_lng: routeEndRef.current.lng,
+        distance: selected.km,
+        duration: selected.durationSeconds,
+        load_count: 0,
+        last_used: null
+      });
+      if (insertError) throw insertError;
+      setShowSaveRouteModal(false);
+      setSaveRouteName('');
+      fetchSavedRoutes();
+    } catch (err) {
+      setSaveRouteError(err.message);
+    } finally {
+      setSavingRoute(false);
     }
   };
 
@@ -1026,6 +1127,15 @@ const Map = ({ profile, onNavigatingChange }) => {
       mapInstance.current.getViewModel().setLookAtData({ bounds: selected.bounds });
     }
   };
+
+  // Top section shows the 3 most-loaded routes; "See more" reveals the rest.
+  // A search query overrides both and filters by name across all routes.
+  const trimmedRouteSearch = routeSearchQuery.trim().toLowerCase();
+  const displayedSavedRoutes = trimmedRouteSearch
+    ? savedRoutes.filter((r) => r.route_name.toLowerCase().includes(trimmedRouteSearch))
+    : routeDropdownExpanded
+      ? savedRoutes
+      : [...savedRoutes].sort((a, b) => (b.load_count || 0) - (a.load_count || 0)).slice(0, 3);
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
@@ -1350,6 +1460,106 @@ const Map = ({ profile, onNavigatingChange }) => {
           width: '280px'
         }}
       >
+        <div ref={routeDropdownRef} style={{ position: 'relative', marginBottom: '10px' }}>
+          <button
+            onClick={() => setShowRouteDropdown((open) => !open)}
+            style={{
+              width: '100%',
+              padding: '8px',
+              background: '#f3f4f6',
+              border: '1px solid #ccc',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '13px',
+              fontWeight: 'bold',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              color: '#374151'
+            }}
+          >
+            <span>Select Previous Route</span>
+            <span>{showRouteDropdown ? '▲' : '▼'}</span>
+          </button>
+
+          {showRouteDropdown && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '100%',
+                left: 0,
+                right: 0,
+                zIndex: 2100,
+                background: 'white',
+                border: '1px solid #ccc',
+                borderRadius: '6px',
+                boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
+                marginTop: '4px',
+                maxHeight: '340px',
+                overflowY: 'auto',
+                padding: '8px'
+              }}
+            >
+              <input
+                type="text"
+                placeholder="Search saved routes..."
+                value={routeSearchQuery}
+                onChange={(e) => setRouteSearchQuery(e.target.value)}
+                style={{ width: '100%', padding: '6px 8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box', marginBottom: '8px', fontSize: '12px' }}
+              />
+
+              {!trimmedRouteSearch && (
+                <div style={{ fontSize: '11px', color: '#888', fontWeight: 'bold', marginBottom: '4px', textTransform: 'uppercase' }}>
+                  {routeDropdownExpanded ? 'All Saved Routes' : 'Most Used'}
+                </div>
+              )}
+
+              {savedRoutes.length === 0 ? (
+                <div style={{ fontSize: '12px', color: '#888', padding: '10px', textAlign: 'center' }}>No saved routes yet</div>
+              ) : displayedSavedRoutes.length === 0 ? (
+                <div style={{ fontSize: '12px', color: '#888', padding: '10px', textAlign: 'center' }}>No routes match "{routeSearchQuery}"</div>
+              ) : (
+                displayedSavedRoutes.map((route) => (
+                  <button
+                    key={route.id}
+                    onClick={() => loadSavedRoute(route)}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      textAlign: 'left',
+                      padding: '8px',
+                      marginBottom: '4px',
+                      border: '1px solid #eee',
+                      borderRadius: '6px',
+                      background: 'white',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit'
+                    }}
+                  >
+                    <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#111827' }}>{route.route_name}</div>
+                    <div style={{ fontSize: '11px', color: '#555', marginTop: '2px' }}>
+                      {route.start_location} → {route.end_location}
+                    </div>
+                    <div style={{ fontSize: '11px', color: '#888', marginTop: '2px', display: 'flex', justifyContent: 'space-between' }}>
+                      <span>{route.distance != null ? `${route.distance} km` : ''}</span>
+                      <span>{route.last_used ? `Last used ${new Date(route.last_used).toLocaleDateString()}` : 'Never used'}</span>
+                    </div>
+                  </button>
+                ))
+              )}
+
+              {!trimmedRouteSearch && !routeDropdownExpanded && savedRoutes.length > 3 && (
+                <button
+                  onClick={() => setRouteDropdownExpanded(true)}
+                  style={{ width: '100%', padding: '6px', background: 'transparent', border: 'none', color: '#e85d04', fontWeight: 'bold', fontSize: '12px', cursor: 'pointer' }}
+                >
+                  See more ({savedRoutes.length - 3} more)
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         <div ref={startWrapperRef} style={{ position: 'relative', marginBottom: '8px' }}>
           <input
             type="text"
@@ -1439,7 +1649,7 @@ const Map = ({ profile, onNavigatingChange }) => {
           )}
         </div>
         <button
-          onClick={calculateRoute}
+          onClick={() => calculateRoute()}
           disabled={searching}
           style={{
             width: '100%',
@@ -1483,6 +1693,24 @@ const Map = ({ profile, onNavigatingChange }) => {
         )}
         {routeOptions.length > 0 && (
           <button
+            onClick={() => { setSaveRouteName(''); setSaveRouteError(''); setShowSaveRouteModal(true); }}
+            style={{
+              width: '100%',
+              marginTop: '10px',
+              padding: '10px',
+              background: 'white',
+              color: '#e85d04',
+              border: '1px solid #e85d04',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontWeight: 'bold'
+            }}
+          >
+            Save This Route
+          </button>
+        )}
+        {routeOptions.length > 0 && (
+          <button
             onClick={startNavigation}
             style={{
               width: '100%',
@@ -1519,6 +1747,51 @@ const Map = ({ profile, onNavigatingChange }) => {
           <div style={{ marginTop: '8px', color: '#c0392b' }}>{error}</div>
         )}
       </div>
+      )}
+      {showSaveRouteModal && (
+        <div
+          onClick={() => setShowSaveRouteModal(false)}
+          style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '280px' }}>
+            <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>Save This Route</h3>
+            <input
+              type="text"
+              placeholder="Route name"
+              value={saveRouteName}
+              onChange={(e) => setSaveRouteName(e.target.value)}
+              autoFocus
+              style={{ width: '100%', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box', marginBottom: '10px' }}
+            />
+            {saveRouteError && (
+              <div style={{ color: '#c0392b', fontSize: '12px', marginBottom: '8px' }}>{saveRouteError}</div>
+            )}
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={() => setShowSaveRouteModal(false)}
+                style={{ flex: 1, padding: '8px', background: '#eee', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveRoute}
+                disabled={savingRoute}
+                style={{
+                  flex: 1,
+                  padding: '8px',
+                  background: savingRoute ? '#aaa' : '#16a34a',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: savingRoute ? 'not-allowed' : 'pointer',
+                  fontWeight: 'bold'
+                }}
+              >
+                {savingRoute ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
       {!navigating && provincesOnRoute.length > 0 && (
         <div
