@@ -63,7 +63,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
   return (
     <div style={{
       position: 'absolute',
-      top: '20px',
+      top: '90px',
       right: '20px',
       zIndex: 1000,
       background: 'white',

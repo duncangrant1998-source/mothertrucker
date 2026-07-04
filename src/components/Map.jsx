@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { getStationsNearRoute } from '../lib/inspectionStations';
 
 const WEIGH_STATION_TERMS = ['weigh station', 'inspection station'];
 
@@ -18,6 +19,8 @@ const Map = ({ profile }) => {
   const bubbleRef = useRef(null);
   const weighIconRef = useRef(null);
   const weighMarkersRef = useRef([]);
+  const inspectionIconRef = useRef(null);
+  const inspectionMarkersRef = useRef([]);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -37,6 +40,7 @@ const Map = ({ profile }) => {
   const [searching, setSearching] = useState(false);
   const [routeInfo, setRouteInfo] = useState(null);
   const [error, setError] = useState('');
+  const [inspectionStationCount, setInspectionStationCount] = useState(0);
 
   useEffect(() => {
     if (!mapInstance.current && mapRef.current) {
@@ -58,8 +62,18 @@ const Map = ({ profile }) => {
         { size: { w: 18, h: 18 }, anchor: { x: 9, y: 9 } }
       );
 
+      inspectionIconRef.current = new H.map.Icon(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">' +
+          '<circle cx="12" cy="12" r="10" fill="#0ea5e9" stroke="white" stroke-width="3"/>' +
+        '</svg>',
+        { size: { w: 24, h: 24 }, anchor: { x: 12, y: 12 } }
+      );
+
       map.addEventListener('tap', (evt) => {
-        if (bubbleRef.current && !weighMarkersRef.current.includes(evt.target)) {
+        const isStationMarker =
+          weighMarkersRef.current.includes(evt.target) ||
+          inspectionMarkersRef.current.includes(evt.target);
+        if (bubbleRef.current && !isStationMarker) {
           uiRef.current.removeBubble(bubbleRef.current);
           bubbleRef.current = null;
         }
@@ -208,6 +222,51 @@ const Map = ({ profile }) => {
     if (markers.length) mapInstance.current.addObjects(markers);
   };
 
+  const openInspectionStationBubble = (marker, station) => {
+    if (bubbleRef.current) {
+      uiRef.current.removeBubble(bubbleRef.current);
+      bubbleRef.current = null;
+    }
+
+    const content = `
+      <div style="font-family:sans-serif;font-size:13px;max-width:220px;">
+        <strong style="display:block;margin-bottom:4px;font-size:14px;">${escapeHtml(station.name || 'MTO Inspection Station')}</strong>
+        <div style="margin-bottom:2px;"><strong>Highway:</strong> ${escapeHtml(station.highway || 'Not available')}</div>
+        <div style="margin-bottom:2px;"><strong>Direction:</strong> ${escapeHtml(station.direction || 'Not available')}</div>
+        <div style="margin-bottom:2px;"><strong>Region:</strong> ${escapeHtml(station.region || 'Not available')}</div>
+        <div><strong>Phone:</strong> ${escapeHtml(station.phone || 'Not available')}</div>
+      </div>
+    `;
+
+    const bubble = new H.ui.InfoBubble(marker.getGeometry(), { content });
+    uiRef.current.addBubble(bubble);
+    bubbleRef.current = bubble;
+  };
+
+  const renderInspectionStations = (stations) => {
+    console.log(`Found ${stations.length} inspection station(s) near route`);
+
+    if (inspectionMarkersRef.current.length) {
+      mapInstance.current.removeObjects(inspectionMarkersRef.current);
+      inspectionMarkersRef.current = [];
+    }
+
+    const markers = stations
+      .filter((station) => station.latitude != null && station.longitude != null)
+      .map((station) => {
+        const marker = new H.map.Marker(
+          { lat: station.latitude, lng: station.longitude },
+          { icon: inspectionIconRef.current }
+        );
+        marker.addEventListener('tap', () => openInspectionStationBubble(marker, station));
+        return marker;
+      });
+
+    inspectionMarkersRef.current = markers;
+    if (markers.length) mapInstance.current.addObjects(markers);
+    setInspectionStationCount(markers.length);
+  };
+
   const findWeighStations = (bounds) => {
     const bbox = `${bounds.getLeft()},${bounds.getBottom()},${bounds.getRight()},${bounds.getTop()}`;
     const search = platformRef.current.getSearchService();
@@ -269,6 +328,8 @@ const Map = ({ profile }) => {
           }
           mapInstance.current.removeObjects(mapInstance.current.getObjects());
           weighMarkersRef.current = [];
+          inspectionMarkersRef.current = [];
+          setInspectionStationCount(0);
 
           const section = result.routes[0].sections[0];
           const polyline = new H.map.Polyline(
@@ -288,6 +349,10 @@ const Map = ({ profile }) => {
           setRouteInfo(`${km} km · ${hours}h ${minutes}m`);
 
           findWeighStations(bounds);
+          getStationsNearRoute(start.lat, start.lng, end.lat, end.lng).then((stations) => {
+            console.log('Inspection stations from Supabase:', stations);
+            renderInspectionStations(stations);
+          });
         } else {
           setError('No route found');
         }
@@ -423,6 +488,22 @@ const Map = ({ profile }) => {
         </button>
         {routeInfo && (
           <div style={{ marginTop: '8px', color: '#2c662d', fontWeight: 'bold' }}>{routeInfo}</div>
+        )}
+        {routeInfo && inspectionStationCount > 0 && (
+          <div
+            style={{
+              marginTop: '8px',
+              padding: '8px',
+              background: '#fef3c7',
+              border: '1px solid #f59e0b',
+              borderRadius: '4px',
+              color: '#92400e',
+              fontSize: '13px',
+              fontWeight: 'bold'
+            }}
+          >
+            ⚠️ {inspectionStationCount} MTO inspection station{inspectionStationCount === 1 ? '' : 's'} on this route — stay alert for flashing signs
+          </div>
         )}
         {error && (
           <div style={{ marginTop: '8px', color: '#c0392b' }}>{error}</div>
