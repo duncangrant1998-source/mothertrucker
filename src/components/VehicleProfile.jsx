@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
+import { fetchOntarioInspectionStations } from '../lib/inspectionStations';
 
 const VehicleProfile = ({ onProfileUpdate }) => {
   const [profile, setProfile] = useState({
@@ -12,6 +13,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
   });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+  const [syncingStations, setSyncingStations] = useState(false);
 
   useEffect(() => {
     loadProfile();
@@ -53,6 +55,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
       if (error) throw error;
       setMessage('Profile saved!');
       onProfileUpdate(profile);
+      syncInspectionStationsIfEmpty();
     } catch (err) {
       setMessage(`Error: ${err.message}`);
     } finally {
@@ -60,10 +63,27 @@ const VehicleProfile = ({ onProfileUpdate }) => {
     }
   };
 
+  const syncInspectionStationsIfEmpty = async () => {
+    try {
+      const { count, error } = await supabase
+        .from('inspection_stations')
+        .select('*', { count: 'exact', head: true });
+      if (error) throw error;
+      if (count === 0) {
+        setSyncingStations(true);
+        await fetchOntarioInspectionStations();
+        setSyncingStations(false);
+      }
+    } catch (err) {
+      console.error('Failed to sync inspection stations:', err);
+      setSyncingStations(false);
+    }
+  };
+
   return (
     <div style={{
       position: 'absolute',
-      top: '90px',
+      top: '20px',
       right: '20px',
       zIndex: 1000,
       background: 'white',
@@ -172,6 +192,17 @@ const VehicleProfile = ({ onProfileUpdate }) => {
           textAlign: 'center'
         }}>
           {message}
+        </p>
+      )}
+
+      {syncingStations && (
+        <p style={{
+          marginTop: '8px',
+          fontSize: '11px',
+          color: '#888',
+          textAlign: 'center'
+        }}>
+          Loading stations...
         </p>
       )}
     </div>
