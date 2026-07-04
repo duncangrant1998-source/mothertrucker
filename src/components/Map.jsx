@@ -16,8 +16,20 @@ const UNSELECTED_ROUTE_STYLE = { strokeColor: 'rgba(148,163,184,0.6)', lineWidth
 
 const NAV_ZOOM = 16;
 const OFF_ROUTE_METERS = 100;
-const STATION_ALERT_METERS = 5000;
 const FORWARD_BIAS_RATIO = 0.68;
+
+// Distance thresholds for the two-stage proximity alert system (stations,
+// highway exits, and turn maneuvers all share the same pipeline).
+const ALERT_TOAST_METERS = 2000;
+const ALERT_BANNER_METERS = 500;
+const ALERT_PASSED_METERS = 100;
+const ALERT_TOAST_DURATION_MS = 15000;
+
+const ALERT_STYLES = {
+  station: { background: '#dc2626', color: 'white', defaultName: 'MTO Inspection Station' },
+  exit: { background: '#f59e0b', color: '#111827', defaultName: 'Highway Exit' },
+  turn: { background: '#2563eb', color: 'white', defaultName: 'Turn' }
+};
 
 const toRad = (deg) => (deg * Math.PI) / 180;
 const toDeg = (rad) => (rad * 180) / Math.PI;
@@ -161,9 +173,14 @@ const describeAction = (action) => {
   return road ? `Continue on ${road}` : 'Continue';
 };
 
+// Only 'exit' (highway off-ramp) and turn/uTurn maneuvers are alert-worthy;
+// depart/arrive/continue/ramp/roundabout actions are excluded to avoid noise.
+const ACTION_ALERT_KIND = { exit: 'exit', turn: 'turn', uTurn: 'turn' };
+
 const buildNavActions = (section, cumulative) => (section.actions || []).map((action) => ({
   text: describeAction(action),
-  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1]
+  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1],
+  alertKind: ACTION_ALERT_KIND[action.action] || null
 }));
 
 const createDriverIcon = (headingDeg) => new H.map.Icon(
@@ -208,6 +225,8 @@ const Map = ({ profile, onNavigatingChange }) => {
   const navCumulativeDurationRef = useRef([]);
   const navTotalLengthRef = useRef(0);
   const navTotalDurationRef = useRef(0);
+  const alertStateRef = useRef(new Map());
+  const toastTimeoutRef = useRef(null);
   const autoUnitIntervalRef = useRef(null);
   const optionsMenuRef = useRef(null);
   const startWrapperRef = useRef(null);
@@ -235,7 +254,8 @@ const Map = ({ profile, onNavigatingChange }) => {
   const [recalculating, setRecalculating] = useState(false);
   const [currentInstruction, setCurrentInstruction] = useState(null);
   const [nextInstruction, setNextInstruction] = useState(null);
-  const [nearbyStationAlert, setNearbyStationAlert] = useState(null);
+  const [toastAlert, setToastAlert] = useState(null);
+  const [bannerAlert, setBannerAlert] = useState(null);
   const [provincesOnRoute, setProvincesOnRoute] = useState([]);
   const [optionsMenuOpen, setOptionsMenuOpen] = useState(false);
   const [speedUnitMenuOpen, setSpeedUnitMenuOpen] = useState(false);
@@ -749,6 +769,13 @@ const Map = ({ profile, onNavigatingChange }) => {
     );
     lastIndexRef.current = 0;
 
+    // A new/recalculated route invalidates action offsets, so drop all
+    // per-point alert bookkeeping and any alert currently on screen.
+    alertStateRef.current = new Map();
+    clearTimeout(toastTimeoutRef.current);
+    setToastAlert(null);
+    setBannerAlert(null);
+
     // Seed trip stats from the route summary right away so the panel shows
     // real numbers before the first GPS fix arrives; handlePositionUpdate
     // overwrites this with progress-adjusted values once GPS is live.
@@ -859,16 +886,71 @@ const Map = ({ profile, onNavigatingChange }) => {
       etaMs: Date.now() + Math.max(0, totalDuration - traveledDuration) * 1000
     });
 
-    const ahead = (currentInspectionStationsRef.current || [])
-      .map((station) => {
-        const distanceMeters = haversineMeters(currentPos, { lat: station.latitude, lng: station.longitude });
-        const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
-        return { station, distanceMeters, stationIndex };
-      })
-      .filter(({ distanceMeters, stationIndex }) => distanceMeters <= STATION_ALERT_METERS && stationIndex >= index - 3)
-      .sort((a, b) => a.distanceMeters - b.distanceMeters)[0];
+    updateProximityAlerts(currentPos, points, index, travelled);
+  };
 
-    setNearbyStationAlert(ahead ? { name: ahead.station.name, distanceKm: ahead.distanceMeters / 1000 } : null);
+  // Builds the combined list of upcoming alert-worthy points (MTO stations,
+  // highway exits, turn maneuvers), then drives the two-stage toast/banner
+  // alert pipeline: a 2km toast that fires once per point, and a persistent
+  // 500m banner with a live countdown that clears 100m past the point.
+  const updateProximityAlerts = (currentPos, points, index, travelled) => {
+    const candidates = [];
+
+    (currentInspectionStationsRef.current || []).forEach((station) => {
+      if (station.latitude == null || station.longitude == null) return;
+      const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+      if (stationIndex < index - 3) return;
+      candidates.push({
+        id: `station-${station.id ?? `${station.latitude},${station.longitude}`}`,
+        kind: 'station',
+        name: station.name || ALERT_STYLES.station.defaultName,
+        distanceMeters: haversineMeters(currentPos, { lat: station.latitude, lng: station.longitude })
+      });
+    });
+
+    navActionsRef.current.forEach((action, i) => {
+      if (!action.alertKind) return;
+      const distanceMeters = action.distanceMeters - travelled;
+      if (distanceMeters < -ALERT_TOAST_METERS) return;
+      candidates.push({
+        id: `action-${i}`,
+        kind: action.alertKind,
+        name: action.text,
+        distanceMeters
+      });
+    });
+
+    const bannerCandidate = candidates
+      .filter((p) => p.distanceMeters <= ALERT_BANNER_METERS && p.distanceMeters > -ALERT_PASSED_METERS)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters)[0] || null;
+
+    setBannerAlert(bannerCandidate ? {
+      id: bannerCandidate.id,
+      kind: bannerCandidate.kind,
+      name: bannerCandidate.name,
+      distanceMeters: bannerCandidate.distanceMeters
+    } : null);
+
+    const toastCandidate = candidates
+      .filter((p) => p.distanceMeters <= ALERT_TOAST_METERS && p.distanceMeters > ALERT_BANNER_METERS)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters)[0] || null;
+
+    if (toastCandidate) {
+      const state = alertStateRef.current.get(toastCandidate.id);
+      if (!state?.toastShown) {
+        alertStateRef.current.set(toastCandidate.id, { toastShown: true });
+        clearTimeout(toastTimeoutRef.current);
+        setToastAlert({ id: toastCandidate.id, kind: toastCandidate.kind, name: toastCandidate.name });
+        toastTimeoutRef.current = setTimeout(() => {
+          setToastAlert((current) => (current?.id === toastCandidate.id ? null : current));
+        }, ALERT_TOAST_DURATION_MS);
+      }
+    }
+  };
+
+  const dismissToastAlert = () => {
+    clearTimeout(toastTimeoutRef.current);
+    setToastAlert(null);
   };
 
   const startNavigation = () => {
@@ -883,7 +965,8 @@ const Map = ({ profile, onNavigatingChange }) => {
     setRecalculating(false);
     setCurrentInstruction(null);
     setNextInstruction(null);
-    setNearbyStationAlert(null);
+    setToastAlert(null);
+    setBannerAlert(null);
     setCurrentSpeedMps(null);
     setCurrentSpeedLimitMps(null);
     setTripStats(null);
@@ -919,12 +1002,16 @@ const Map = ({ profile, onNavigatingChange }) => {
       navPolylineRef.current = null;
     }
 
+    clearTimeout(toastTimeoutRef.current);
+    alertStateRef.current = new Map();
+
     setNavigating(false);
     onNavigatingChange?.(false);
     setRecalculating(false);
     setCurrentInstruction(null);
     setNextInstruction(null);
-    setNearbyStationAlert(null);
+    setToastAlert(null);
+    setBannerAlert(null);
     setCurrentSpeedMps(null);
     setCurrentSpeedLimitMps(null);
     setTripStats(null);
@@ -993,24 +1080,61 @@ const Map = ({ profile, onNavigatingChange }) => {
             </div>
           )}
 
-          {nearbyStationAlert && (
+          {bannerAlert ? (
             <div
               style={{
                 position: 'absolute',
-                top: recalculating ? '160px' : '110px',
-                left: '10px',
-                right: '10px',
-                zIndex: 2400,
-                background: '#dc2626',
-                color: 'white',
+                top: '96px',
+                left: '16px',
+                zIndex: 2600,
+                maxWidth: '280px',
+                background: ALERT_STYLES[bannerAlert.kind].background,
+                color: ALERT_STYLES[bannerAlert.kind].color,
                 padding: '12px 16px',
                 borderRadius: '8px',
                 fontWeight: 'bold',
-                textAlign: 'center',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.3)'
+                boxShadow: '0 4px 14px rgba(0,0,0,0.4)'
               }}
             >
-              ⚠️ MTO Inspection Station in {nearbyStationAlert.distanceKm.toFixed(1)} km — watch for flashing lights
+              ⚠️ {bannerAlert.name} - {Math.max(0, Math.round(bannerAlert.distanceMeters))}m ahead
+            </div>
+          ) : toastAlert && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '96px',
+                left: '16px',
+                zIndex: 2600,
+                maxWidth: '280px',
+                background: 'white',
+                color: '#111827',
+                padding: '12px 36px 12px 14px',
+                borderRadius: '8px',
+                borderLeft: `6px solid ${ALERT_STYLES[toastAlert.kind].background}`,
+                boxShadow: '0 4px 14px rgba(0,0,0,0.3)'
+              }}
+            >
+              <button
+                onClick={dismissToastAlert}
+                aria-label="Dismiss alert"
+                style={{
+                  position: 'absolute',
+                  top: '6px',
+                  right: '8px',
+                  border: 'none',
+                  background: 'transparent',
+                  color: '#6b7280',
+                  fontSize: '14px',
+                  fontWeight: 'bold',
+                  cursor: 'pointer',
+                  lineHeight: 1
+                }}
+              >
+                ✕
+              </button>
+              <div style={{ fontSize: '14px', fontWeight: 'bold' }}>
+                Incoming: {toastAlert.name}
+              </div>
             </div>
           )}
 
