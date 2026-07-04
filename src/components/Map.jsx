@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import { supabase } from '../lib/supabase';
 import { getStationsNearRoute } from '../lib/inspectionStations';
+import { PROVINCE_PERMITS, getProvincesForBounds } from '../lib/provincePermits';
 
 const WEIGH_STATION_TERMS = ['weigh station', 'inspection station'];
 
@@ -77,6 +79,79 @@ const formatDistance = (meters) => {
   return `${(meters / 1000).toFixed(1)} km`;
 };
 
+const formatDurationShort = (seconds) => {
+  const totalMinutes = Math.max(0, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+};
+
+const MPS_TO_KPH = 3.6;
+const MPS_TO_MPH = 2.23694;
+
+const unitLabel = (unit) => (unit === 'mph' ? 'mph' : 'km/h');
+
+const formatSpeedValue = (mps, unit) => {
+  if (mps == null) return '—';
+  return Math.round(mps * (unit === 'mph' ? MPS_TO_MPH : MPS_TO_KPH));
+};
+
+const SPEED_UNIT_OPTIONS = [
+  { value: 'auto', label: 'Auto-detect (default)' },
+  { value: 'kmh', label: 'Kilometers per hour' },
+  { value: 'mph', label: 'Miles per hour' }
+];
+
+const MENU_ITEM_STYLE = {
+  display: 'block',
+  width: '100%',
+  textAlign: 'left',
+  padding: '10px 14px',
+  border: 'none',
+  background: 'white',
+  fontSize: '13px',
+  cursor: 'pointer',
+  borderBottom: '1px solid #eee'
+};
+
+// Distributes each span's HERE-reported duration across the points it covers
+// (proportional to distance travelled within the span), so remaining-time/ETA
+// can be read off by point index the same way remaining distance already is.
+// Falls back to a constant-average-speed split when spans/durations aren't
+// available, e.g. before the routing response includes span data.
+const buildCumulativeSpanDurations = (points, spans, cumulativeDistance, totalDuration) => {
+  const n = points.length;
+  const durations = new Array(n).fill(0);
+  if (!spans || !spans.length) {
+    const totalDistance = cumulativeDistance[n - 1] || 1;
+    for (let i = 0; i < n; i++) durations[i] = (cumulativeDistance[i] / totalDistance) * totalDuration;
+    return durations;
+  }
+  let runningDuration = 0;
+  for (let s = 0; s < spans.length; s++) {
+    const startIdx = spans[s].offset;
+    const endIdx = s + 1 < spans.length ? spans[s + 1].offset : n - 1;
+    const spanDuration = spans[s].duration ?? 0;
+    const spanDist = (cumulativeDistance[endIdx] - cumulativeDistance[startIdx]) || 1;
+    for (let i = startIdx; i <= endIdx; i++) {
+      const ratio = (cumulativeDistance[i] - cumulativeDistance[startIdx]) / spanDist;
+      durations[i] = runningDuration + ratio * spanDuration;
+    }
+    runningDuration += spanDuration;
+  }
+  return durations;
+};
+
+// HERE's spans array is sorted by ascending offset (start point index of each
+// span) — the last span whose offset hasn't passed `index` yet is the one
+// the driver is currently on.
+const speedLimitAtIndex = (spans, index) => {
+  for (let s = spans.length - 1; s >= 0; s--) {
+    if (spans[s].offset <= index) return spans[s].speedLimit?.maxSpeed ?? null;
+  }
+  return null;
+};
+
 const describeAction = (action) => {
   if (action.instruction) return action.instruction;
   const road = action.nextRoad?.name?.[0]?.value || action.currentRoad?.name?.[0]?.value;
@@ -108,7 +183,7 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   "'": '&#39;'
 }[c]));
 
-const Map = ({ profile }) => {
+const Map = ({ profile, onNavigatingChange }) => {
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
   const platformRef = useRef(null);
@@ -129,6 +204,12 @@ const Map = ({ profile }) => {
   const lastPositionRef = useRef(null);
   const recalculatingRef = useRef(false);
   const routeEndRef = useRef(null);
+  const navSpansRef = useRef([]);
+  const navCumulativeDurationRef = useRef([]);
+  const navTotalLengthRef = useRef(0);
+  const navTotalDurationRef = useRef(0);
+  const autoUnitIntervalRef = useRef(null);
+  const optionsMenuRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -155,6 +236,18 @@ const Map = ({ profile }) => {
   const [currentInstruction, setCurrentInstruction] = useState(null);
   const [nextInstruction, setNextInstruction] = useState(null);
   const [nearbyStationAlert, setNearbyStationAlert] = useState(null);
+  const [provincesOnRoute, setProvincesOnRoute] = useState([]);
+  const [optionsMenuOpen, setOptionsMenuOpen] = useState(false);
+  const [speedUnitMenuOpen, setSpeedUnitMenuOpen] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [showMtoContactModal, setShowMtoContactModal] = useState(false);
+  const [speedUnit, setSpeedUnit] = useState('auto');
+  const [autoUnit, setAutoUnit] = useState('kmh');
+  const [currentSpeedMps, setCurrentSpeedMps] = useState(null);
+  const [currentSpeedLimitMps, setCurrentSpeedLimitMps] = useState(null);
+  const [tripStats, setTripStats] = useState(null);
+
+  const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
 
   useEffect(() => {
     if (!mapInstance.current && mapRef.current) {
@@ -168,6 +261,13 @@ const Map = ({ profile }) => {
       });
       new H.mapevents.Behavior(new H.mapevents.MapEvents(map));
       const ui = H.ui.UI.createDefault(map, defaultLayers);
+
+      // Move the layer swatch, zoom buttons, and scale bar to bottom-left so
+      // they stay clear of the trip stats panel docked bottom-right.
+      ['mapsettings', 'zoom', 'scalebar'].forEach((controlName) => {
+        const control = ui.getControl(controlName);
+        if (control) control.setAlignment(H.ui.LayoutAlignment.LEFT_BOTTOM);
+      });
 
       weighIconRef.current = new H.map.Icon(
         '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18">' +
@@ -209,10 +309,74 @@ const Map = ({ profile }) => {
       if (endOutside && !endInteractingRef.current) {
         setEndSuggestions([]);
       }
+      if (optionsMenuRef.current && !optionsMenuRef.current.contains(e.target)) {
+        setOptionsMenuOpen(false);
+        setSpeedUnitMenuOpen(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return;
+        const { data, error } = await supabase
+          .from('vehicle_profiles')
+          .select('speed_unit')
+          .eq('user_id', user.id)
+          .single();
+        if (error) throw error;
+        if (data?.speed_unit) setSpeedUnit(data.speed_unit);
+      } catch (err) {
+        console.error('Failed to load speed unit preference:', err);
+      }
+    })();
+  }, []);
+
+  // Re-checks the driver's country every few minutes while navigating so
+  // auto-detect can flip units on a cross-border trip without polling constantly.
+  useEffect(() => {
+    if (!navigating) {
+      if (autoUnitIntervalRef.current) {
+        clearInterval(autoUnitIntervalRef.current);
+        autoUnitIntervalRef.current = null;
+      }
+      return;
+    }
+    const detectUnit = () => {
+      const pos = lastPositionRef.current;
+      if (!pos || !platformRef.current) return;
+      platformRef.current.getSearchService().reverseGeocode({ at: `${pos.lat},${pos.lng}` }, (result) => {
+        const countryCode = result.items?.[0]?.address?.countryCode;
+        setAutoUnit(countryCode === 'USA' ? 'mph' : 'kmh');
+      }, () => {});
+    };
+    detectUnit();
+    autoUnitIntervalRef.current = setInterval(detectUnit, 3 * 60 * 1000);
+    return () => {
+      if (autoUnitIntervalRef.current) clearInterval(autoUnitIntervalRef.current);
+    };
+  }, [navigating]);
+
+  const handleSelectSpeedUnit = async (unit) => {
+    setSpeedUnit(unit);
+    setOptionsMenuOpen(false);
+    setSpeedUnitMenuOpen(false);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+      const { error } = await supabase
+        .from('vehicle_profiles')
+        .update({ speed_unit: unit })
+        .eq('user_id', user.id);
+      if (error) throw error;
+    } catch (err) {
+      console.error('Failed to save speed unit preference:', err);
+    }
+  };
 
   // Autosuggest (not Geocode) so business names/landmarks like "Canadian Tire
   // Motorsport Park" resolve, not just structured street addresses.
@@ -458,6 +622,7 @@ const Map = ({ profile }) => {
     setError('');
     setRouteOptions([]);
     setSelectedRouteId(null);
+    setProvincesOnRoute([]);
     try {
       const resolve = (location, resolvedRef) =>
         resolvedRef.current?.text === location ? Promise.resolve(resolvedRef.current.position) : resolveLocation(location);
@@ -471,6 +636,7 @@ const Map = ({ profile }) => {
         destination: `${end.lat},${end.lng}`,
         transportMode: 'truck',
         return: 'polyline,summary,tolls,actions,instructions',
+        spans: 'speedLimit,length,duration',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
         'vehicle[height]': (profile?.height || 4) * 100,
         'vehicle[width]': (profile?.width || 2.5) * 100,
@@ -546,6 +712,7 @@ const Map = ({ profile }) => {
       routeEndRef.current = { lat: end.lat, lng: end.lng };
       setRouteOptions(options);
       setSelectedRouteId(options[0].id);
+      setProvincesOnRoute(getProvincesForBounds(combinedBounds));
       updateStationsForRoute(options[0].bounds);
       setSearching(false);
     } catch (err) {
@@ -571,7 +738,25 @@ const Map = ({ profile }) => {
     navRoutePointsRef.current = points;
     navCumulativeRef.current = cumulative;
     navActionsRef.current = buildNavActions(section, cumulative);
+    navSpansRef.current = section.spans || [];
+    navTotalLengthRef.current = section.summary?.length ?? cumulative[cumulative.length - 1] ?? 0;
+    navTotalDurationRef.current = section.summary?.duration ?? 0;
+    navCumulativeDurationRef.current = buildCumulativeSpanDurations(
+      points,
+      navSpansRef.current,
+      cumulative,
+      navTotalDurationRef.current
+    );
     lastIndexRef.current = 0;
+
+    // Seed trip stats from the route summary right away so the panel shows
+    // real numbers before the first GPS fix arrives; handlePositionUpdate
+    // overwrites this with progress-adjusted values once GPS is live.
+    setTripStats({
+      remainingKm: navTotalLengthRef.current / 1000,
+      remainingSeconds: navTotalDurationRef.current,
+      etaMs: Date.now() + navTotalDurationRef.current * 1000
+    });
 
     if (navPolylineRef.current) {
       mapInstance.current.removeObject(navPolylineRef.current);
@@ -594,6 +779,7 @@ const Map = ({ profile }) => {
         transportMode: 'truck',
         routingMode: 'fast',
         return: 'polyline,summary,tolls,actions,instructions',
+        spans: 'speedLimit,length,duration',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
         'vehicle[height]': (profile?.height || 4) * 100,
         'vehicle[width]': (profile?.width || 2.5) * 100,
@@ -658,6 +844,21 @@ const Map = ({ profile }) => {
     setCurrentInstruction(next ? { text: next.text, distanceMeters: Math.max(0, next.distanceMeters - travelled) } : null);
     setNextInstruction(after ? { text: after.text } : null);
 
+    const speedMps = typeof position.coords.speed === 'number' && !Number.isNaN(position.coords.speed)
+      ? Math.max(0, position.coords.speed)
+      : null;
+    setCurrentSpeedMps(speedMps);
+    setCurrentSpeedLimitMps(speedLimitAtIndex(navSpansRef.current, index));
+
+    const totalLength = navTotalLengthRef.current;
+    const totalDuration = navTotalDurationRef.current;
+    const traveledDuration = navCumulativeDurationRef.current[index] ?? 0;
+    setTripStats({
+      remainingKm: Math.max(0, totalLength - travelled) / 1000,
+      remainingSeconds: Math.max(0, totalDuration - traveledDuration),
+      etaMs: Date.now() + Math.max(0, totalDuration - traveledDuration) * 1000
+    });
+
     const ahead = (currentInspectionStationsRef.current || [])
       .map((station) => {
         const distanceMeters = haversineMeters(currentPos, { lat: station.latitude, lng: station.longitude });
@@ -683,6 +884,11 @@ const Map = ({ profile }) => {
     setCurrentInstruction(null);
     setNextInstruction(null);
     setNearbyStationAlert(null);
+    setCurrentSpeedMps(null);
+    setCurrentSpeedLimitMps(null);
+    setTripStats(null);
+    setOptionsMenuOpen(false);
+    setSpeedUnitMenuOpen(false);
     lastPositionRef.current = null;
     lastIndexRef.current = 0;
     recalculatingRef.current = false;
@@ -690,6 +896,7 @@ const Map = ({ profile }) => {
     mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
     applyNavRoute(selected.section);
     setNavigating(true);
+    onNavigatingChange?.(true);
 
     watchIdRef.current = navigator.geolocation.watchPosition(handlePositionUpdate, handlePositionError, {
       enableHighAccuracy: true,
@@ -713,10 +920,14 @@ const Map = ({ profile }) => {
     }
 
     setNavigating(false);
+    onNavigatingChange?.(false);
     setRecalculating(false);
     setCurrentInstruction(null);
     setNextInstruction(null);
     setNearbyStationAlert(null);
+    setCurrentSpeedMps(null);
+    setCurrentSpeedLimitMps(null);
+    setTripStats(null);
 
     const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
     if (selected) {
@@ -824,6 +1035,181 @@ const Map = ({ profile }) => {
           >
             Stop Navigation
           </button>
+
+          <div ref={optionsMenuRef} style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 2700 }}>
+            <button
+              onClick={() => setOptionsMenuOpen((open) => !open)}
+              style={{
+                width: '40px',
+                height: '40px',
+                borderRadius: '50%',
+                border: 'none',
+                background: '#111827',
+                color: 'white',
+                fontSize: '20px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.4)'
+              }}
+            >
+              ⋮
+            </button>
+
+            {optionsMenuOpen && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '48px',
+                  right: 0,
+                  width: '210px',
+                  background: 'white',
+                  borderRadius: '8px',
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
+                  overflow: 'hidden'
+                }}
+              >
+                <button
+                  onClick={() => { setShowProfileModal(true); setOptionsMenuOpen(false); }}
+                  style={MENU_ITEM_STYLE}
+                >
+                  View Profile
+                </button>
+                <button
+                  onClick={() => { setShowMtoContactModal(true); setOptionsMenuOpen(false); }}
+                  style={MENU_ITEM_STYLE}
+                >
+                  MTO Contact Info
+                </button>
+                <button
+                  onClick={() => setSpeedUnitMenuOpen((open) => !open)}
+                  style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid #eee' : 'none' }}
+                >
+                  Speed Units {speedUnitMenuOpen ? '▲' : '▼'}
+                </button>
+                {speedUnitMenuOpen && SPEED_UNIT_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    onClick={() => handleSelectSpeedUnit(opt.value)}
+                    style={{
+                      ...MENU_ITEM_STYLE,
+                      paddingLeft: '26px',
+                      fontSize: '12px',
+                      background: speedUnit === opt.value ? '#fff7ed' : 'white',
+                      fontWeight: speedUnit === opt.value ? 'bold' : 'normal'
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div
+            style={{
+              position: 'absolute',
+              top: '64px',
+              right: '16px',
+              zIndex: 2600,
+              background: '#111827',
+              color: 'white',
+              borderRadius: '10px',
+              padding: '10px 14px',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+              textAlign: 'center',
+              minWidth: '110px'
+            }}
+          >
+            <div style={{ fontSize: '22px', fontWeight: 'bold', lineHeight: 1.1 }}>
+              {formatSpeedValue(currentSpeedMps, effectiveSpeedUnit)}
+            </div>
+            <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '6px' }}>
+              {unitLabel(effectiveSpeedUnit)}
+            </div>
+            <div style={{ fontSize: '12px', color: '#93c5fd' }}>
+              Limit: {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
+            </div>
+          </div>
+
+          {tripStats && (
+            <div
+              style={{
+                position: 'absolute',
+                bottom: '46px',
+                right: '16px',
+                zIndex: 2500,
+                background: 'rgba(17,24,39,0.8)',
+                color: 'white',
+                borderRadius: '10px',
+                padding: '10px 14px',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
+                minWidth: '150px',
+                fontSize: '13px',
+                lineHeight: '1.6'
+              }}
+            >
+              <div>📍 Remaining: {tripStats.remainingKm.toFixed(0)} km</div>
+              <div>
+                🕐 ETA: {new Date(tripStats.etaMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+              </div>
+              <div>⏱ Time left: {formatDurationShort(tripStats.remainingSeconds)}</div>
+            </div>
+          )}
+
+          {showProfileModal && (
+            <div
+              onClick={() => setShowProfileModal(false)}
+              style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '260px' }}>
+                <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>Vehicle Profile</h3>
+                <div style={{ fontSize: '13px', lineHeight: '1.8' }}>
+                  <div>Height: {profile?.height || 'Not set'} m</div>
+                  <div>Width: {profile?.width || 'Not set'} m</div>
+                  <div>Length: {profile?.length || 'Not set'} m</div>
+                  <div>Weight: {profile?.weight || 'Not set'} kg</div>
+                  <div>Axles: {profile?.axles || 'Not set'}</div>
+                  <div>Load type: {profile?.load_type || 'Not set'}</div>
+                </div>
+                <button
+                  onClick={() => setShowProfileModal(false)}
+                  style={{ marginTop: '16px', width: '100%', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showMtoContactModal && (
+            <div
+              onClick={() => setShowMtoContactModal(false)}
+              style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '260px' }}>
+                <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>MTO Contact Info</h3>
+                <div style={{ fontSize: '13px', lineHeight: '1.8' }}>
+                  <div><strong>Phone:</strong> <a href={`tel:${PROVINCE_PERMITS.Ontario.phone}`}>{PROVINCE_PERMITS.Ontario.phone}</a></div>
+                  <div><strong>Permits:</strong> {PROVINCE_PERMITS.Ontario.permitRequired}</div>
+                  <div><strong>Escort:</strong> {PROVINCE_PERMITS.Ontario.escort}</div>
+                </div>
+                <a
+                  href={PROVINCE_PERMITS.Ontario.portalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ display: 'block', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: '6px', textDecoration: 'none', fontWeight: 'bold' }}
+                >
+                  Open Permit Portal
+                </a>
+                <button
+                  onClick={() => setShowMtoContactModal(false)}
+                  style={{ marginTop: '10px', width: '100%', padding: '8px', background: '#eee', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
         </>
       )}
       {!navigating && (
@@ -1009,6 +1395,73 @@ const Map = ({ profile }) => {
           <div style={{ marginTop: '8px', color: '#c0392b' }}>{error}</div>
         )}
       </div>
+      )}
+      {!navigating && provincesOnRoute.length > 0 && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: '20px',
+            left: '20px',
+            right: '20px',
+            zIndex: 2000,
+            display: 'flex',
+            gap: '12px',
+            overflowX: 'auto',
+            paddingBottom: '4px'
+          }}
+        >
+          {provincesOnRoute.map((key) => {
+            const permit = PROVINCE_PERMITS[key];
+            return (
+              <div
+                key={key}
+                style={{
+                  flex: '0 0 240px',
+                  background: permit.color,
+                  color: 'white',
+                  borderRadius: '10px',
+                  padding: '14px',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
+                }}
+              >
+                <div style={{ fontSize: '15px', fontWeight: 'bold', marginBottom: '8px' }}>
+                  {permit.name}
+                </div>
+                <div style={{ fontSize: '12px', marginBottom: '6px' }}>
+                  <strong>Permit:</strong> {permit.permitRequired} permit required
+                </div>
+                <div style={{ fontSize: '12px', marginBottom: '6px' }}>
+                  <strong>Escort:</strong> {permit.escort}
+                </div>
+                <div style={{ fontSize: '12px', marginBottom: '6px' }}>
+                  <strong>Seasonal:</strong> {permit.seasonal}
+                </div>
+                <div style={{ fontSize: '12px', marginBottom: '10px' }}>
+                  <strong>Phone:</strong>{' '}
+                  <a href={`tel:${permit.phone}`} style={{ color: 'white' }}>{permit.phone}</a>
+                </div>
+                <a
+                  href={permit.portalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    display: 'block',
+                    textAlign: 'center',
+                    padding: '8px',
+                    background: 'rgba(255,255,255,0.2)',
+                    borderRadius: '6px',
+                    color: 'white',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    textDecoration: 'none'
+                  }}
+                >
+                  Learn more
+                </a>
+              </div>
+            );
+          })}
+        </div>
       )}
       <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
     </div>

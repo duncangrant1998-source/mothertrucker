@@ -8,6 +8,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState(null);
+  const [navigating, setNavigating] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -30,8 +31,8 @@ function App() {
         <Auth onAuthChange={() => setUser(true)} />
       ) : (
         <>
-          <Map profile={profile} />
-          <VehicleProfile onProfileUpdate={setProfile} />
+          <Map profile={profile} onNavigatingChange={setNavigating} />
+          {!navigating && <VehicleProfile onProfileUpdate={setProfile} />}
         </>
       )}
     </div>
