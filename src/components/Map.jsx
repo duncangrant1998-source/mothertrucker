@@ -3,6 +3,103 @@ import { getStationsNearRoute } from '../lib/inspectionStations';
 
 const WEIGH_STATION_TERMS = ['weigh station', 'inspection station'];
 
+const ROUTE_CONFIGS = [
+  { id: 'fastest', label: 'Fastest', routingMode: 'fast', avoidTolls: false },
+  { id: 'notolls', label: 'No Tolls', routingMode: 'fast', avoidTolls: true },
+  { id: 'shortest', label: 'Shortest', routingMode: 'short', avoidTolls: false }
+];
+
+const SELECTED_ROUTE_STYLE = { strokeColor: '#e85d04', lineWidth: 5 };
+const UNSELECTED_ROUTE_STYLE = { strokeColor: 'rgba(148,163,184,0.6)', lineWidth: 4 };
+
+const NAV_ZOOM = 16;
+const OFF_ROUTE_METERS = 100;
+const STATION_ALERT_METERS = 5000;
+const FORWARD_BIAS_RATIO = 0.68;
+
+const toRad = (deg) => (deg * Math.PI) / 180;
+const toDeg = (rad) => (rad * 180) / Math.PI;
+
+const haversineMeters = (a, b) => {
+  const R = 6371000;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const h = sinDLat * sinDLat + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinDLng * sinDLng;
+  return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+};
+
+const bearingDegrees = (from, to) => {
+  const y = Math.sin(toRad(to.lng - from.lng)) * Math.cos(toRad(to.lat));
+  const x = Math.cos(toRad(from.lat)) * Math.sin(toRad(to.lat)) -
+    Math.sin(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.cos(toRad(to.lng - from.lng));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+};
+
+const decodeRoutePoints = (polyline) => {
+  const flat = H.geo.LineString.fromFlexiblePolyline(polyline).getLatLngAltArray();
+  const points = [];
+  for (let i = 0; i < flat.length; i += 3) {
+    points.push({ lat: flat[i], lng: flat[i + 1] });
+  }
+  return points;
+};
+
+const buildCumulativeDistances = (points) => {
+  const cumulative = [0];
+  for (let i = 1; i < points.length; i++) {
+    cumulative.push(cumulative[i - 1] + haversineMeters(points[i - 1], points[i]));
+  }
+  return cumulative;
+};
+
+// Searches a window around fromIndex (the driver's last known position on the
+// route) instead of the whole polyline, since GPS ticks arrive ~once a second
+// and the driver can only have moved a short distance along the route.
+const nearestPointIndex = (points, lat, lng, fromIndex = 0, window = points.length) => {
+  const start = Math.max(0, fromIndex - 5);
+  const end = Math.min(points.length - 1, fromIndex + window);
+  let bestIndex = start;
+  let bestDistance = Infinity;
+  for (let i = start; i <= end; i++) {
+    const d = haversineMeters({ lat, lng }, points[i]);
+    if (d < bestDistance) {
+      bestDistance = d;
+      bestIndex = i;
+    }
+  }
+  return { index: bestIndex, distance: bestDistance };
+};
+
+const formatDistance = (meters) => {
+  if (meters < 950) return `${Math.max(0, Math.round(meters))} m`;
+  return `${(meters / 1000).toFixed(1)} km`;
+};
+
+const describeAction = (action) => {
+  if (action.instruction) return action.instruction;
+  const road = action.nextRoad?.name?.[0]?.value || action.currentRoad?.name?.[0]?.value;
+  if (action.action === 'depart') return road ? `Head out on ${road}` : 'Head out';
+  if (action.action === 'arrive') return 'Arrive at destination';
+  if (action.direction) return road ? `Turn ${action.direction} onto ${road}` : `Turn ${action.direction}`;
+  return road ? `Continue on ${road}` : 'Continue';
+};
+
+const buildNavActions = (section, cumulative) => (section.actions || []).map((action) => ({
+  text: describeAction(action),
+  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1]
+}));
+
+const createDriverIcon = (headingDeg) => new H.map.Icon(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">' +
+    `<g transform="rotate(${headingDeg} 16 16)">` +
+      '<path d="M16 3 L26 27 L16 21 L6 27 Z" fill="#2563eb" stroke="white" stroke-width="2" stroke-linejoin="round"/>' +
+    '</g>' +
+  '</svg>',
+  { size: { w: 32, h: 32 }, anchor: { x: 16, y: 16 } }
+);
+
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   '&': '&amp;',
   '<': '&lt;',
@@ -21,6 +118,17 @@ const Map = ({ profile }) => {
   const weighMarkersRef = useRef([]);
   const inspectionIconRef = useRef(null);
   const inspectionMarkersRef = useRef([]);
+  const currentInspectionStationsRef = useRef([]);
+  const watchIdRef = useRef(null);
+  const driverMarkerRef = useRef(null);
+  const navPolylineRef = useRef(null);
+  const navRoutePointsRef = useRef(null);
+  const navCumulativeRef = useRef(null);
+  const navActionsRef = useRef([]);
+  const lastIndexRef = useRef(0);
+  const lastPositionRef = useRef(null);
+  const recalculatingRef = useRef(false);
+  const routeEndRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -38,9 +146,15 @@ const Map = ({ profile }) => {
   const [startSuggestLoading, setStartSuggestLoading] = useState(false);
   const [endSuggestLoading, setEndSuggestLoading] = useState(false);
   const [searching, setSearching] = useState(false);
-  const [routeInfo, setRouteInfo] = useState(null);
+  const [routeOptions, setRouteOptions] = useState([]);
+  const [selectedRouteId, setSelectedRouteId] = useState(null);
   const [error, setError] = useState('');
   const [inspectionStationCount, setInspectionStationCount] = useState(0);
+  const [navigating, setNavigating] = useState(false);
+  const [recalculating, setRecalculating] = useState(false);
+  const [currentInstruction, setCurrentInstruction] = useState(null);
+  const [nextInstruction, setNextInstruction] = useState(null);
+  const [nearbyStationAlert, setNearbyStationAlert] = useState(null);
 
   useEffect(() => {
     if (!mapInstance.current && mapRef.current) {
@@ -245,6 +359,7 @@ const Map = ({ profile }) => {
 
   const renderInspectionStations = (stations) => {
     console.log(`Found ${stations.length} inspection station(s) near route`);
+    currentInspectionStationsRef.current = stations;
 
     if (inspectionMarkersRef.current.length) {
       mapInstance.current.removeObjects(inspectionMarkersRef.current);
@@ -292,6 +407,46 @@ const Map = ({ profile }) => {
     });
   };
 
+  const updateStationsForRoute = (bounds) => {
+    findWeighStations(bounds);
+    getStationsNearRoute(
+      bounds.getTop(),
+      bounds.getLeft(),
+      bounds.getBottom(),
+      bounds.getRight()
+    ).then((stations) => {
+      console.log('Inspection stations from Supabase:', stations);
+      renderInspectionStations(stations);
+    });
+  };
+
+  const selectRoute = (routeId) => {
+    if (routeId === selectedRouteId) return;
+    const selected = routeOptions.find((opt) => opt.id === routeId);
+    if (!selected) return;
+
+    setSelectedRouteId(routeId);
+
+    routeOptions.forEach((opt) => {
+      opt.polyline.setStyle(opt.id === routeId ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+    });
+    mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
+    const ordered = [
+      ...routeOptions.filter((opt) => opt.id !== routeId).map((opt) => opt.polyline),
+      selected.polyline
+    ];
+    mapInstance.current.addObjects(ordered);
+
+    updateStationsForRoute(selected.bounds);
+  };
+
+  const calculateSingleRoute = (router, params) => new Promise((resolve, reject) => {
+    router.calculateRoute(params, (result) => {
+      if (result.routes?.length) resolve(result.routes[0]);
+      else reject(new Error('No route found'));
+    }, (err) => reject(err));
+  });
+
   const calculateRoute = async () => {
     setStartSuggestions([]);
     setEndSuggestions([]);
@@ -301,7 +456,8 @@ const Map = ({ profile }) => {
     }
     setSearching(true);
     setError('');
-    setRouteInfo(null);
+    setRouteOptions([]);
+    setSelectedRouteId(null);
     try {
       const resolve = (location, resolvedRef) =>
         resolvedRef.current?.text === location ? Promise.resolve(resolvedRef.current.position) : resolveLocation(location);
@@ -310,65 +466,367 @@ const Map = ({ profile }) => {
         resolve(endLocation, endResolvedRef)
       ]);
       const router = platformRef.current.getRoutingService(null, 8);
-      router.calculateRoute({
+      const baseParams = {
         origin: `${start.lat},${start.lng}`,
         destination: `${end.lat},${end.lng}`,
         transportMode: 'truck',
-        return: 'polyline,summary',
+        return: 'polyline,summary,tolls,actions,instructions',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
         'vehicle[height]': (profile?.height || 4) * 100,
         'vehicle[width]': (profile?.width || 2.5) * 100,
         'vehicle[length]': (profile?.length || 15) * 100,
         'vehicle[axleCount]': profile?.axles || 5
-      }, (result) => {
-        if (result.routes?.length) {
-          if (bubbleRef.current) {
-            uiRef.current.removeBubble(bubbleRef.current);
-            bubbleRef.current = null;
-          }
-          mapInstance.current.removeObjects(mapInstance.current.getObjects());
-          weighMarkersRef.current = [];
-          inspectionMarkersRef.current = [];
-          setInspectionStationCount(0);
+      };
 
-          const section = result.routes[0].sections[0];
-          const polyline = new H.map.Polyline(
-            H.geo.LineString.fromFlexiblePolyline(section.polyline),
-            { style: { strokeColor: '#e85d04', lineWidth: 5 } }
-          );
-          const startMarker = new H.map.Marker({ lat: start.lat, lng: start.lng });
-          const endMarker = new H.map.Marker({ lat: end.lat, lng: end.lng });
-          mapInstance.current.addObjects([polyline, startMarker, endMarker]);
+      const results = await Promise.all(
+        ROUTE_CONFIGS.map((config) => {
+          const params = { ...baseParams, routingMode: config.routingMode };
+          if (config.avoidTolls) params['avoid[features]'] = 'tollRoad';
+          return calculateSingleRoute(router, params)
+            .then((route) => ({ config, route }))
+            .catch(() => null);
+        })
+      );
 
-          const bounds = polyline.getBoundingBox();
-          mapInstance.current.getViewModel().setLookAtData({ bounds });
-
-          const km = (section.summary.length / 1000).toFixed(0);
-          const hours = Math.floor(section.summary.duration / 3600);
-          const minutes = Math.floor((section.summary.duration % 3600) / 60);
-          setRouteInfo(`${km} km · ${hours}h ${minutes}m`);
-
-          findWeighStations(bounds);
-          getStationsNearRoute(start.lat, start.lng, end.lat, end.lng).then((stations) => {
-            console.log('Inspection stations from Supabase:', stations);
-            renderInspectionStations(stations);
-          });
-        } else {
-          setError('No route found');
-        }
+      const validResults = results.filter(Boolean);
+      if (!validResults.length) {
+        setError('No route found');
         setSearching(false);
-      }, () => {
-        setError('Routing failed. The truck profile may be incompatible with available roads.');
-        setSearching(false);
+        return;
+      }
+
+      if (bubbleRef.current) {
+        uiRef.current.removeBubble(bubbleRef.current);
+        bubbleRef.current = null;
+      }
+      mapInstance.current.removeObjects(mapInstance.current.getObjects());
+      weighMarkersRef.current = [];
+      inspectionMarkersRef.current = [];
+      setInspectionStationCount(0);
+
+      const options = validResults.map(({ config, route }) => {
+        const section = route.sections[0];
+        const polyline = new H.map.Polyline(H.geo.LineString.fromFlexiblePolyline(section.polyline));
+        const bounds = polyline.getBoundingBox();
+        const hasTolls = Boolean(section.tolls && section.tolls.length > 0);
+        const km = Math.round(section.summary.length / 1000);
+        const hours = Math.floor(section.summary.duration / 3600);
+        const minutes = Math.floor((section.summary.duration % 3600) / 60);
+        return {
+          id: config.id,
+          label: config.label,
+          km,
+          durationText: `${hours}h ${minutes}m`,
+          hasTolls,
+          polyline,
+          bounds,
+          section
+        };
       });
+
+      options.forEach((opt, index) => {
+        opt.polyline.setStyle(index === 0 ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+      });
+      const orderedPolylines = [...options.slice(1).map((opt) => opt.polyline), options[0].polyline];
+      const startMarker = new H.map.Marker({ lat: start.lat, lng: start.lng });
+      const endMarker = new H.map.Marker({ lat: end.lat, lng: end.lng });
+      mapInstance.current.addObjects([...orderedPolylines, startMarker, endMarker]);
+
+      const combinedBounds = options.reduce((acc, opt) => {
+        if (!acc) return opt.bounds;
+        return new H.geo.Rect(
+          Math.max(acc.getTop(), opt.bounds.getTop()),
+          Math.min(acc.getLeft(), opt.bounds.getLeft()),
+          Math.min(acc.getBottom(), opt.bounds.getBottom()),
+          Math.max(acc.getRight(), opt.bounds.getRight())
+        );
+      }, null);
+      mapInstance.current.getViewModel().setLookAtData({ bounds: combinedBounds });
+
+      routeEndRef.current = { lat: end.lat, lng: end.lng };
+      setRouteOptions(options);
+      setSelectedRouteId(options[0].id);
+      updateStationsForRoute(options[0].bounds);
+      setSearching(false);
     } catch (err) {
       setError(err.message);
       setSearching(false);
     }
   };
 
+  // Shifts the map center so the driver renders below screen-center (more of
+  // the road ahead is visible) rather than dead-center, independent of heading.
+  const followDriver = (lat, lng) => {
+    const height = mapRef.current.clientHeight;
+    const desiredY = height * FORWARD_BIAS_RATIO;
+    const driverScreen = mapInstance.current.geoToScreen({ lat, lng });
+    const targetScreen = { x: driverScreen.x, y: height / 2 + driverScreen.y - desiredY };
+    const targetGeo = mapInstance.current.screenToGeo(targetScreen.x, targetScreen.y);
+    mapInstance.current.setCenter({ lat: targetGeo.lat, lng: targetGeo.lng });
+  };
+
+  const applyNavRoute = (section) => {
+    const points = decodeRoutePoints(section.polyline);
+    const cumulative = buildCumulativeDistances(points);
+    navRoutePointsRef.current = points;
+    navCumulativeRef.current = cumulative;
+    navActionsRef.current = buildNavActions(section, cumulative);
+    lastIndexRef.current = 0;
+
+    if (navPolylineRef.current) {
+      mapInstance.current.removeObject(navPolylineRef.current);
+    }
+    const polyline = new H.map.Polyline(H.geo.LineString.fromFlexiblePolyline(section.polyline), { style: SELECTED_ROUTE_STYLE });
+    mapInstance.current.addObject(polyline);
+    navPolylineRef.current = polyline;
+
+    updateStationsForRoute(polyline.getBoundingBox());
+  };
+
+  const recalculateFromCurrentPosition = async (lat, lng) => {
+    try {
+      const destination = routeEndRef.current;
+      if (!destination || !platformRef.current) return;
+      const router = platformRef.current.getRoutingService(null, 8);
+      const route = await calculateSingleRoute(router, {
+        origin: `${lat},${lng}`,
+        destination: `${destination.lat},${destination.lng}`,
+        transportMode: 'truck',
+        routingMode: 'fast',
+        return: 'polyline,summary,tolls,actions,instructions',
+        'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
+        'vehicle[height]': (profile?.height || 4) * 100,
+        'vehicle[width]': (profile?.width || 2.5) * 100,
+        'vehicle[length]': (profile?.length || 15) * 100,
+        'vehicle[axleCount]': profile?.axles || 5
+      });
+      applyNavRoute(route.sections[0]);
+    } catch (err) {
+      console.error('Recalculation failed:', err);
+    } finally {
+      setRecalculating(false);
+    }
+  };
+
+  const handlePositionError = (err) => {
+    console.error('Geolocation error:', err);
+    setError(`Location error: ${err.message}`);
+  };
+
+  const handlePositionUpdate = (position) => {
+    const { latitude, longitude, heading } = position.coords;
+    const currentPos = { lat: latitude, lng: longitude };
+    const prev = lastPositionRef.current;
+    const effectiveHeading = (typeof heading === 'number' && !Number.isNaN(heading))
+      ? heading
+      : (prev ? bearingDegrees(prev, currentPos) : 0);
+    lastPositionRef.current = currentPos;
+
+    if (!driverMarkerRef.current) {
+      driverMarkerRef.current = new H.map.Marker(currentPos, { icon: createDriverIcon(effectiveHeading) });
+      mapInstance.current.addObject(driverMarkerRef.current);
+      mapInstance.current.setZoom(NAV_ZOOM);
+    } else {
+      driverMarkerRef.current.setGeometry(currentPos);
+      driverMarkerRef.current.setIcon(createDriverIcon(effectiveHeading));
+    }
+
+    followDriver(latitude, longitude);
+
+    const points = navRoutePointsRef.current;
+    const cumulative = navCumulativeRef.current;
+    if (!points || !points.length) return;
+
+    const { index, distance } = nearestPointIndex(points, latitude, longitude, lastIndexRef.current, 80);
+    lastIndexRef.current = index;
+
+    if (distance > OFF_ROUTE_METERS) {
+      if (!recalculatingRef.current) {
+        recalculatingRef.current = true;
+        setRecalculating(true);
+        recalculateFromCurrentPosition(latitude, longitude).finally(() => {
+          recalculatingRef.current = false;
+        });
+      }
+      return;
+    }
+
+    const travelled = cumulative[index];
+    const upcoming = navActionsRef.current.filter((a) => a.distanceMeters >= travelled - 20);
+    const next = upcoming[0] || null;
+    const after = upcoming[1] || null;
+    setCurrentInstruction(next ? { text: next.text, distanceMeters: Math.max(0, next.distanceMeters - travelled) } : null);
+    setNextInstruction(after ? { text: after.text } : null);
+
+    const ahead = (currentInspectionStationsRef.current || [])
+      .map((station) => {
+        const distanceMeters = haversineMeters(currentPos, { lat: station.latitude, lng: station.longitude });
+        const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+        return { station, distanceMeters, stationIndex };
+      })
+      .filter(({ distanceMeters, stationIndex }) => distanceMeters <= STATION_ALERT_METERS && stationIndex >= index - 3)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters)[0];
+
+    setNearbyStationAlert(ahead ? { name: ahead.station.name, distanceKm: ahead.distanceMeters / 1000 } : null);
+  };
+
+  const startNavigation = () => {
+    if (!navigator.geolocation) {
+      setError('Geolocation is not supported by this browser.');
+      return;
+    }
+    const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
+    if (!selected) return;
+
+    setError('');
+    setRecalculating(false);
+    setCurrentInstruction(null);
+    setNextInstruction(null);
+    setNearbyStationAlert(null);
+    lastPositionRef.current = null;
+    lastIndexRef.current = 0;
+    recalculatingRef.current = false;
+
+    mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
+    applyNavRoute(selected.section);
+    setNavigating(true);
+
+    watchIdRef.current = navigator.geolocation.watchPosition(handlePositionUpdate, handlePositionError, {
+      enableHighAccuracy: true,
+      maximumAge: 0,
+      timeout: 20000
+    });
+  };
+
+  const stopNavigation = () => {
+    if (watchIdRef.current != null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (driverMarkerRef.current) {
+      mapInstance.current.removeObject(driverMarkerRef.current);
+      driverMarkerRef.current = null;
+    }
+    if (navPolylineRef.current) {
+      mapInstance.current.removeObject(navPolylineRef.current);
+      navPolylineRef.current = null;
+    }
+
+    setNavigating(false);
+    setRecalculating(false);
+    setCurrentInstruction(null);
+    setNextInstruction(null);
+    setNearbyStationAlert(null);
+
+    const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
+    if (selected) {
+      routeOptions.forEach((opt) => {
+        opt.polyline.setStyle(opt.id === selectedRouteId ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+      });
+      mapInstance.current.addObjects(routeOptions.map((opt) => opt.polyline));
+      updateStationsForRoute(selected.bounds);
+      mapInstance.current.getViewModel().setLookAtData({ bounds: selected.bounds });
+    }
+  };
+
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      {navigating && (
+        <>
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              zIndex: 2500,
+              background: '#111827',
+              color: 'white',
+              padding: '16px 20px',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.4)'
+            }}
+          >
+            {currentInstruction ? (
+              <>
+                <div style={{ fontSize: '20px', fontWeight: 'bold' }}>{currentInstruction.text}</div>
+                <div style={{ fontSize: '14px', color: '#93c5fd', marginTop: '2px' }}>
+                  In {formatDistance(currentInstruction.distanceMeters)}
+                </div>
+                {nextInstruction && (
+                  <div style={{ fontSize: '13px', color: '#9ca3af', marginTop: '6px' }}>
+                    Then {nextInstruction.text}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={{ fontSize: '16px' }}>Follow the highlighted route</div>
+            )}
+          </div>
+
+          {recalculating && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '110px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 2500,
+                background: '#fbbf24',
+                color: '#78350f',
+                padding: '8px 16px',
+                borderRadius: '6px',
+                fontWeight: 'bold'
+              }}
+            >
+              Recalculating...
+            </div>
+          )}
+
+          {nearbyStationAlert && (
+            <div
+              style={{
+                position: 'absolute',
+                top: recalculating ? '160px' : '110px',
+                left: '10px',
+                right: '10px',
+                zIndex: 2400,
+                background: '#dc2626',
+                color: 'white',
+                padding: '12px 16px',
+                borderRadius: '8px',
+                fontWeight: 'bold',
+                textAlign: 'center',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.3)'
+              }}
+            >
+              ⚠️ MTO Inspection Station in {nearbyStationAlert.distanceKm.toFixed(1)} km — watch for flashing lights
+            </div>
+          )}
+
+          <button
+            onClick={stopNavigation}
+            style={{
+              position: 'absolute',
+              bottom: '30px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 2500,
+              padding: '14px 28px',
+              background: '#dc2626',
+              color: 'white',
+              border: 'none',
+              borderRadius: '30px',
+              fontWeight: 'bold',
+              fontSize: '15px',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+              cursor: 'pointer'
+            }}
+          >
+            Stop Navigation
+          </button>
+        </>
+      )}
+      {!navigating && (
       <div
         style={{
           position: 'absolute',
@@ -486,10 +944,52 @@ const Map = ({ profile }) => {
         >
           {searching ? 'Calculating...' : 'Find Truck Route'}
         </button>
-        {routeInfo && (
-          <div style={{ marginTop: '8px', color: '#2c662d', fontWeight: 'bold' }}>{routeInfo}</div>
+        {routeOptions.length > 0 && (
+          <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {routeOptions.map((opt) => (
+              <button
+                key={opt.id}
+                onClick={() => selectRoute(opt.id)}
+                style={{
+                  textAlign: 'left',
+                  padding: '10px 12px',
+                  borderRadius: '8px',
+                  border: opt.id === selectedRouteId ? '2px solid #e85d04' : '1px solid #ddd',
+                  background: opt.id === selectedRouteId ? '#fff7ed' : 'white',
+                  cursor: 'pointer',
+                  fontFamily: 'inherit'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontWeight: 'bold', fontSize: '13px' }}>{opt.label}</span>
+                  <span style={{ fontSize: '15px' }}>{opt.hasTolls ? '🏷️' : '✅'}</span>
+                </div>
+                <div style={{ fontSize: '12px', color: '#555', marginTop: '2px' }}>
+                  {opt.km} km · {opt.durationText}
+                </div>
+              </button>
+            ))}
+          </div>
         )}
-        {routeInfo && inspectionStationCount > 0 && (
+        {routeOptions.length > 0 && (
+          <button
+            onClick={startNavigation}
+            style={{
+              width: '100%',
+              marginTop: '10px',
+              padding: '10px',
+              background: '#16a34a',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontWeight: 'bold'
+            }}
+          >
+            Start Navigation
+          </button>
+        )}
+        {routeOptions.length > 0 && inspectionStationCount > 0 && (
           <div
             style={{
               marginTop: '8px',
@@ -509,6 +1009,7 @@ const Map = ({ profile }) => {
           <div style={{ marginTop: '8px', color: '#c0392b' }}>{error}</div>
         )}
       </div>
+      )}
       <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
     </div>
   );
