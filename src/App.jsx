@@ -35,7 +35,7 @@ function App() {
       {passwordRecovery ? (
         <ResetPassword onDone={() => setPasswordRecovery(false)} />
       ) : !user ? (
-        <Auth onAuthChange={() => setUser(true)} />
+        <Auth onAuthChange={setUser} />
       ) : (
         <>
           <Map profile={profile} onNavigatingChange={setNavigating} />

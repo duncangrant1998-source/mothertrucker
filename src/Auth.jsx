@@ -21,13 +21,13 @@ const Auth = ({ onAuthChange }) => {
         if (error) throw error;
         setMessage('Check your email to confirm signup!');
       } else {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
         setMessage('Logged in!');
-        onAuthChange();
+        onAuthChange(data.user);
       }
     } catch (err) {
-      setMessage(`Error: ${err.message}`);
+      setMessage(`Error: ${err?.message || 'Something went wrong'}`);
     } finally {
       setLoading(false);
     }
@@ -54,9 +54,9 @@ const Auth = ({ onAuthChange }) => {
       setShowForgotPassword(false);
       setMessage('Password reset email sent — check your inbox');
     } catch (err) {
-      setResetError(err.message === 'Failed to fetch'
+      setResetError(err?.message === 'Failed to fetch'
         ? 'Network error — check your connection and try again'
-        : err.message);
+        : (err?.message || 'Something went wrong'));
     } finally {
       setResetLoading(false);
     }

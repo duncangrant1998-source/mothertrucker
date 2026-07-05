@@ -200,7 +200,7 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   "'": '&#39;'
 }[c]));
 
-const Map = ({ profile, onNavigatingChange }) => {
+const MapView = ({ profile, onNavigatingChange }) => {
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
   const platformRef = useRef(null);
@@ -1865,4 +1865,4 @@ const Map = ({ profile, onNavigatingChange }) => {
   );
 };
 
-export default Map;
+export default MapView;
