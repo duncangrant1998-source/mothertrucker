@@ -1,6 +1,11 @@
 /*
  * Design tokens — "Industrial Precision" / "Logistics Blueprint"
  * Day values live on :root; night values override under prefers-color-scheme.
+ * A manual choice from the drawer's Color Scheme toggle stamps data-theme on
+ * <html>, which wins over prefers-color-scheme (higher-specificity attribute
+ * selector) regardless of source order — see App.jsx. No data-theme attribute
+ * means no manual override yet, so prefers-color-scheme keeps driving things
+ * exactly as before.
  * Kept as plain custom properties (not Tailwind @theme) so the same var()
  * strings work in inline styles, this file, and Tailwind arbitrary values
  * (bg-[var(--color-panel)]) alike, and so HERE Maps canvas colors (which
@@ -36,6 +41,30 @@
     --color-text-muted: #7C848A;
     --color-border: #33383D;
   }
+}
+
+:root[data-theme="light"] {
+  --color-bg: #EDF0F3;
+  --color-panel: #FFFFFF;
+  --color-grid-line: #DCE1E6;
+  --color-route-normal: #2E9E52;
+  --color-route-alert: #FF6B00;
+  --color-text-primary: #1B1F23;
+  --color-text-muted: #6B747C;
+  --color-border: #C9D0D7;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #15171A;
+  --color-panel: #1F2327;
+  --color-grid-line: #22262A;
+  --color-route-normal: #5FCB7A;
+  --color-route-alert: #FF6B00;
+  --color-text-primary: #F0F0EE;
+  --color-text-muted: #7C848A;
+  --color-border: #33383D;
+  color-scheme: dark;
 }
 
 /* App-wide default so screens that never set fontFamily themselves (Auth,

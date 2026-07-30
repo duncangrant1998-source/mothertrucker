@@ -13,11 +13,38 @@ const ROUTE_CONFIGS = [
 
 // HERE's canvas-rendered polylines can't consume CSS custom properties, so the
 // route-normal token is duplicated here (day/night) and picked via the same
-// prefers-color-scheme query the CSS tokens respond to.
+// mechanism tokens.css responds to: a manual data-theme override on <html>
+// (set by the drawer's Color Scheme toggle) takes precedence, falling back to
+// prefers-color-scheme when no manual choice has been made.
 const ROUTE_NORMAL_COLOR = { day: '#2E9E52', night: '#5FCB7A' };
-const isNightMode = () => typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+const isNightMode = () => {
+  if (typeof document !== 'undefined') {
+    const override = document.documentElement.getAttribute('data-theme');
+    if (override === 'dark') return true;
+    if (override === 'light') return false;
+  }
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+};
 const selectedRouteStyle = () => ({ strokeColor: ROUTE_NORMAL_COLOR[isNightMode() ? 'night' : 'day'], lineWidth: 5 });
 const UNSELECTED_ROUTE_STYLE = { strokeColor: 'rgba(148,163,184,0.6)', lineWidth: 4 };
+
+// The topographic base layer has a genuine night scheme (unlike satellite
+// imagery, which looks the same regardless of theme), so Dark Mode swaps it
+// to HERE's "logistics.night" style instead of relying on CSS filters.
+const getTopoLayer = (defaultLayers, colorScheme) => (
+  colorScheme === 'dark' ? defaultLayers.vector.normal.logisticsnight : defaultLayers.vector.normal.logistics
+);
+
+// The satellite photography itself can't get darker, but HERE's hybrid
+// scheme overlays roads/labels/sky on top of the imagery as a separate
+// vector layer, and that overlay has its own day/night styling. "base" goes
+// through setBaseLayer like the topo layer; "overlay" is added on top via
+// addLayer/removeLayer since setBaseLayer only takes a single layer.
+const getSatelliteLayers = (defaultLayers, colorScheme) => (
+  colorScheme === 'dark'
+    ? { base: defaultLayers.hybrid.night.raster, overlay: defaultLayers.hybrid.night.vector }
+    : { base: defaultLayers.hybrid.day.raster, overlay: defaultLayers.hybrid.day.vector }
+);
 
 const NAV_ZOOM = 16;
 const OFF_ROUTE_METERS = 100;
@@ -239,11 +266,12 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   "'": '&#39;'
 }[c]));
 
-const MapView = ({ profile, mapLayer, gridOverlay, onNavigatingChange }) => {
+const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChange }) => {
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
   const platformRef = useRef(null);
   const defaultLayersRef = useRef(null);
+  const hybridOverlayLayerRef = useRef(null);
   const uiRef = useRef(null);
   const bubbleRef = useRef(null);
   const weighIconRef = useRef(null);
@@ -332,7 +360,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, onNavigatingChange }) => {
       // (including satellite) as a blank canvas, see index.html for details.
       const map = new H.Map(
         mapRef.current,
-        mapLayer === 'satellite' ? defaultLayers.raster.satellite.map : defaultLayers.vector.normal.logistics,
+        mapLayer === 'satellite' ? getSatelliteLayers(defaultLayers, colorScheme).base : getTopoLayer(defaultLayers, colorScheme),
         {
           zoom: 5,
           center: { lat: 56.1304, lng: -106.3468 }
@@ -378,17 +406,48 @@ const MapView = ({ profile, mapLayer, gridOverlay, onNavigatingChange }) => {
     }
   }, []);
 
-  // Swaps only the base tile layer — route polylines, markers, and the grid
-  // overlay are separate map objects/DOM layers untouched by setBaseLayer.
+  // Swaps the base tile layer — route polylines, markers, and the grid
+  // overlay are separate map objects/DOM layers untouched by setBaseLayer/
+  // addLayer. Satellite's hybrid scheme is two layers (raster imagery base +
+  // vector roads/labels overlay), since setBaseLayer only takes one; the topo
+  // layer has no separate overlay. If satellite is currently showing, a
+  // colorScheme change swaps its overlay in place; if satellite isn't showing,
+  // the preference is picked up next time mapLayer switches back to it (this
+  // effect re-runs on that change and re-evaluates getSatelliteLayers).
   useEffect(() => {
     if (!mapInstance.current || !defaultLayersRef.current) return;
-    const layer = mapLayer === 'satellite'
-      ? defaultLayersRef.current.raster.satellite.map
-      : defaultLayersRef.current.vector.normal.logistics;
-    if (mapInstance.current.getBaseLayer() !== layer) {
-      mapInstance.current.setBaseLayer(layer);
+    const map = mapInstance.current;
+    const defaultLayers = defaultLayersRef.current;
+
+    let baseLayer;
+    let overlayLayer = null;
+    if (mapLayer === 'satellite') {
+      ({ base: baseLayer, overlay: overlayLayer } = getSatelliteLayers(defaultLayers, colorScheme));
+    } else {
+      baseLayer = getTopoLayer(defaultLayers, colorScheme);
     }
-  }, [mapLayer]);
+
+    if (map.getBaseLayer() !== baseLayer) {
+      map.setBaseLayer(baseLayer);
+    }
+    if (hybridOverlayLayerRef.current !== overlayLayer) {
+      if (hybridOverlayLayerRef.current) map.removeLayer(hybridOverlayLayerRef.current);
+      if (overlayLayer) map.addLayer(overlayLayer);
+      hybridOverlayLayerRef.current = overlayLayer;
+    }
+  }, [mapLayer, colorScheme]);
+
+  // The route-normal color is baked into the polyline's style object at draw
+  // time (HERE canvas objects can't read CSS vars live), so an already-drawn
+  // route needs its style re-applied when the scheme changes underneath it.
+  useEffect(() => {
+    if (navPolylineRef.current) {
+      navPolylineRef.current.setStyle(selectedRouteStyle());
+    }
+    routeOptions.forEach((opt) => {
+      opt.polyline.setStyle(opt.id === selectedRouteId ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
+    });
+  }, [colorScheme, routeOptions, selectedRouteId]);
 
   useEffect(() => {
     const handleClickOutside = (e) => {
