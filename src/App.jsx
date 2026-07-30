@@ -2,6 +2,9 @@ import { useState, useEffect } from 'react';
 import { supabase } from './lib/supabase';
 import Map from './components/Map';
 import VehicleProfile from './components/VehicleProfile';
+import MenuDrawer from './components/MenuDrawer';
+import MapLayerToggle from './components/MapLayerToggle';
+import GridOverlayToggle from './components/GridOverlayToggle';
 import Auth from './Auth';
 import ResetPassword from './ResetPassword';
 
@@ -11,6 +14,22 @@ function App() {
   const [profile, setProfile] = useState(null);
   const [navigating, setNavigating] = useState(false);
   const [passwordRecovery, setPasswordRecovery] = useState(false);
+  const [mapLayer, setMapLayer] = useState(() => (
+    localStorage.getItem('mapLayer') === 'satellite' ? 'satellite' : 'map'
+  ));
+  const [gridOverlay, setGridOverlay] = useState(() => (
+    localStorage.getItem('gridOverlay') === 'on' ? 'on' : 'off'
+  ));
+
+  const handleMapLayerChange = (value) => {
+    setMapLayer(value);
+    localStorage.setItem('mapLayer', value);
+  };
+
+  const handleGridOverlayChange = (value) => {
+    setGridOverlay(value);
+    localStorage.setItem('gridOverlay', value);
+  };
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -38,8 +57,14 @@ function App() {
         <Auth onAuthChange={setUser} />
       ) : (
         <>
-          <Map profile={profile} onNavigatingChange={setNavigating} />
-          {!navigating && <VehicleProfile onProfileUpdate={setProfile} />}
+          <Map profile={profile} mapLayer={mapLayer} gridOverlay={gridOverlay} onNavigatingChange={setNavigating} />
+          {!navigating && (
+            <MenuDrawer>
+              <VehicleProfile onProfileUpdate={setProfile} />
+              <MapLayerToggle value={mapLayer} onChange={handleMapLayerChange} />
+              <GridOverlayToggle value={gridOverlay} onChange={handleGridOverlayChange} />
+            </MenuDrawer>
+          )}
         </>
       )}
     </div>

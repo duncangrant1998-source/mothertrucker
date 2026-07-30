@@ -6,12 +6,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Truck Nav</title>
 
-    <!-- HERE Maps -->
-    <link rel="stylesheet" type="text/css" href="https://js.api.here.com/v3/3.1/mapsjs-ui.css" />
-    <script src="https://js.api.here.com/v3/3.1/mapsjs-core.js"></script>
-    <script src="https://js.api.here.com/v3/3.1/mapsjs-service.js"></script>
-    <script src="https://js.api.here.com/v3/3.1/mapsjs-ui.js"></script>
-    <script src="https://js.api.here.com/v3/3.1/mapsjs-mapevents.js"></script>
+    <!-- Industrial Precision typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Oswald:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- HERE Maps — pinned to an explicit patch (not the floating "v3/3.1"
+         alias). Every 3.1.x build (bisected 3.1.10.0 through 3.1.69.2) fails
+         to render any raster base layer: Tangram throws "Cannot read
+         properties of undefined (reading 'retain')" for the non-collision
+         style group and the canvas stays blank. Confirmed not an API-key/
+         entitlement issue (HERE's raw REST tile endpoint returns valid
+         imagery for this key). 3.2.8.0 renders satellite correctly — do not
+         move this back to a floating alias or an untested 3.1.x pin. -->
+    <link rel="stylesheet" type="text/css" href="https://js.api.here.com/v3/3.2.8.0/mapsjs-ui.css" />
+    <script src="https://js.api.here.com/v3/3.2.8.0/mapsjs-core.js"></script>
+    <script src="https://js.api.here.com/v3/3.2.8.0/mapsjs-service.js"></script>
+    <script src="https://js.api.here.com/v3/3.2.8.0/mapsjs-ui.js"></script>
+    <script src="https://js.api.here.com/v3/3.2.8.0/mapsjs-mapevents.js"></script>
   </head>
   <body>
     <div id="root"></div>

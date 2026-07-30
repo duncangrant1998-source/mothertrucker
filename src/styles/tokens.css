@@ -1,0 +1,60 @@
+/*
+ * Design tokens — "Industrial Precision" / "Logistics Blueprint"
+ * Day values live on :root; night values override under prefers-color-scheme.
+ * Kept as plain custom properties (not Tailwind @theme) so the same var()
+ * strings work in inline styles, this file, and Tailwind arbitrary values
+ * (bg-[var(--color-panel)]) alike, and so HERE Maps canvas colors (which
+ * can't consume CSS vars) can read the resolved hex via getComputedStyle.
+ */
+
+:root {
+  --color-bg: #EDF0F3;
+  --color-panel: #FFFFFF;
+  --color-grid-line: #DCE1E6;
+  --color-route-normal: #2E9E52;
+  --color-route-alert: #FF6B00;
+  --color-text-primary: #1B1F23;
+  --color-text-muted: #6B747C;
+  --color-border: #C9D0D7;
+
+  --font-display: 'Oswald', 'Arial Narrow', 'Helvetica Neue', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Roboto Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+
+  --radius-max: 2px;
+  --radius-soft: 10px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #15171A;
+    --color-panel: #1F2327;
+    --color-grid-line: #22262A;
+    --color-route-normal: #5FCB7A;
+    --color-route-alert: #FF6B00;
+    --color-text-primary: #F0F0EE;
+    --color-text-muted: #7C848A;
+    --color-border: #33383D;
+  }
+}
+
+/* App-wide default so screens that never set fontFamily themselves (Auth,
+   ResetPassword) don't fall back to the browser's default serif. Elements
+   that already set fontFamily explicitly (var(--font-mono) for data values,
+   etc.) are unaffected — inline/explicit values always win over inheritance. */
+body {
+  font-family: var(--font-display);
+}
+
+/* Faint 40px blueprint grid, laid over the map as a fixed HUD layer —
+   doesn't pan with the map, just reinforces the "grid structure" motif. */
+.mt-grid-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-grid-line) 55%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-grid-line) 55%, transparent) 1px, transparent 1px);
+  background-size: 40px 40px;
+}

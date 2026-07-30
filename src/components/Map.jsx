@@ -11,7 +11,12 @@ const ROUTE_CONFIGS = [
   { id: 'shortest', label: 'Shortest', routingMode: 'short', avoidTolls: false }
 ];
 
-const SELECTED_ROUTE_STYLE = { strokeColor: '#e85d04', lineWidth: 5 };
+// HERE's canvas-rendered polylines can't consume CSS custom properties, so the
+// route-normal token is duplicated here (day/night) and picked via the same
+// prefers-color-scheme query the CSS tokens respond to.
+const ROUTE_NORMAL_COLOR = { day: '#2E9E52', night: '#5FCB7A' };
+const isNightMode = () => typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+const selectedRouteStyle = () => ({ strokeColor: ROUTE_NORMAL_COLOR[isNightMode() ? 'night' : 'day'], lineWidth: 5 });
 const UNSELECTED_ROUTE_STYLE = { strokeColor: 'rgba(148,163,184,0.6)', lineWidth: 4 };
 
 const NAV_ZOOM = 16;
@@ -68,6 +73,20 @@ const buildCumulativeDistances = (points) => {
   return cumulative;
 };
 
+// Counts inspection stations that lie ahead of the driver's current route
+// index, for the "MTO AHEAD" data panel column. Independent from the alert
+// pipeline below (updateProximityAlerts) so it can't perturb alert timing.
+const countStationsAhead = (points, stations, index) => {
+  if (!points?.length || !stations?.length) return 0;
+  let count = 0;
+  for (const station of stations) {
+    if (station.latitude == null || station.longitude == null) continue;
+    const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+    if (stationIndex >= index) count++;
+  }
+  return count;
+};
+
 // Searches a window around fromIndex (the driver's last known position on the
 // route) instead of the whole polyline, since GPS ticks arrive ~once a second
 // and the driver can only have moved a short distance along the route.
@@ -89,13 +108,6 @@ const nearestPointIndex = (points, lat, lng, fromIndex = 0, window = points.leng
 const formatDistance = (meters) => {
   if (meters < 950) return `${Math.max(0, Math.round(meters))} m`;
   return `${(meters / 1000).toFixed(1)} km`;
-};
-
-const formatDurationShort = (seconds) => {
-  const totalMinutes = Math.max(0, Math.round(seconds / 60));
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 };
 
 const MPS_TO_KPH = 3.6;
@@ -120,10 +132,37 @@ const MENU_ITEM_STYLE = {
   textAlign: 'left',
   padding: '10px 14px',
   border: 'none',
-  background: 'white',
+  background: 'var(--color-panel)',
+  color: 'var(--color-text-primary)',
+  fontFamily: 'var(--font-display)',
   fontSize: '13px',
+  letterSpacing: '0.01em',
   cursor: 'pointer',
-  borderBottom: '1px solid #eee'
+  borderBottom: '1px solid var(--color-border)'
+};
+
+// Shared "Industrial Precision" primitives: all-caps muted micro-labels,
+// monospace data readouts, and flat bordered panels with sharp (<=2px) corners.
+const LABEL_STYLE = {
+  fontFamily: 'var(--font-display)',
+  fontSize: '10px',
+  fontWeight: 600,
+  textTransform: 'uppercase',
+  letterSpacing: '0.08em',
+  color: 'var(--color-text-muted)'
+};
+
+const MONO_STYLE = {
+  fontFamily: 'var(--font-mono)',
+  letterSpacing: 'normal'
+};
+
+const PANEL_STYLE = {
+  background: 'var(--color-panel)',
+  border: '1px solid var(--color-border)',
+  borderRadius: 0,
+  color: 'var(--color-text-primary)',
+  fontFamily: 'var(--font-display)'
 };
 
 // Distributes each span's HERE-reported duration across the points it covers
@@ -200,10 +239,11 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   "'": '&#39;'
 }[c]));
 
-const MapView = ({ profile, onNavigatingChange }) => {
+const MapView = ({ profile, mapLayer, gridOverlay, onNavigatingChange }) => {
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
   const platformRef = useRef(null);
+  const defaultLayersRef = useRef(null);
   const uiRef = useRef(null);
   const bubbleRef = useRef(null);
   const weighIconRef = useRef(null);
@@ -227,6 +267,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
   const navCumulativeDurationRef = useRef([]);
   const navTotalLengthRef = useRef(0);
   const navTotalDurationRef = useRef(0);
+  const navTollRef = useRef(null);
   const alertStateRef = useRef(new Map());
   const toastTimeoutRef = useRef(null);
   const autoUnitIntervalRef = useRef(null);
@@ -285,10 +326,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
         apikey: import.meta.env.VITE_HERE_API_KEY
       });
       const defaultLayers = platform.createDefaultLayers();
-      const map = new H.Map(mapRef.current, defaultLayers.vector.normal.truck, {
-        zoom: 5,
-        center: { lat: 56.1304, lng: -106.3468 }
-      });
+      defaultLayersRef.current = defaultLayers;
+      // Requires the pinned 3.2.8.0 SDK in index.html — every 3.1.x build
+      // (bisected 3.1.10.0 through 3.1.69.2) renders raster base layers
+      // (including satellite) as a blank canvas, see index.html for details.
+      const map = new H.Map(
+        mapRef.current,
+        mapLayer === 'satellite' ? defaultLayers.raster.satellite.map : defaultLayers.vector.normal.logistics,
+        {
+          zoom: 5,
+          center: { lat: 56.1304, lng: -106.3468 }
+        }
+      );
       new H.mapevents.Behavior(new H.mapevents.MapEvents(map));
       const ui = H.ui.UI.createDefault(map, defaultLayers);
 
@@ -328,6 +377,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
       uiRef.current = ui;
     }
   }, []);
+
+  // Swaps only the base tile layer — route polylines, markers, and the grid
+  // overlay are separate map objects/DOM layers untouched by setBaseLayer.
+  useEffect(() => {
+    if (!mapInstance.current || !defaultLayersRef.current) return;
+    const layer = mapLayer === 'satellite'
+      ? defaultLayersRef.current.raster.satellite.map
+      : defaultLayersRef.current.vector.normal.logistics;
+    if (mapInstance.current.getBaseLayer() !== layer) {
+      mapInstance.current.setBaseLayer(layer);
+    }
+  }, [mapLayer]);
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -645,7 +706,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
     setSelectedRouteId(routeId);
 
     routeOptions.forEach((opt) => {
-      opt.polyline.setStyle(opt.id === routeId ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+      opt.polyline.setStyle(opt.id === routeId ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
     });
     mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
     const ordered = [
@@ -699,6 +760,8 @@ const MapView = ({ profile, onNavigatingChange }) => {
         transportMode: 'truck',
         return: 'polyline,summary,tolls,actions,instructions',
         spans: 'speedLimit,length,duration',
+        currency: 'CAD',
+        'tolls[summaries]': 'total',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
         'vehicle[height]': (profile?.height || 4) * 100,
         'vehicle[width]': (profile?.width || 2.5) * 100,
@@ -754,7 +817,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
       });
 
       options.forEach((opt, index) => {
-        opt.polyline.setStyle(index === 0 ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+        opt.polyline.setStyle(index === 0 ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
       });
       const orderedPolylines = [...options.slice(1).map((opt) => opt.polyline), options[0].polyline];
       const startMarker = new H.map.Marker({ lat: start.lat, lng: start.lng });
@@ -862,6 +925,8 @@ const MapView = ({ profile, onNavigatingChange }) => {
     navSpansRef.current = section.spans || [];
     navTotalLengthRef.current = section.summary?.length ?? cumulative[cumulative.length - 1] ?? 0;
     navTotalDurationRef.current = section.summary?.duration ?? 0;
+    const tollTotal = section.summary?.tolls?.total;
+    navTollRef.current = tollTotal ? { value: tollTotal.value, currency: tollTotal.currency } : null;
     navCumulativeDurationRef.current = buildCumulativeSpanDurations(
       points,
       navSpansRef.current,
@@ -883,13 +948,16 @@ const MapView = ({ profile, onNavigatingChange }) => {
     setTripStats({
       remainingKm: navTotalLengthRef.current / 1000,
       remainingSeconds: navTotalDurationRef.current,
-      etaMs: Date.now() + navTotalDurationRef.current * 1000
+      etaMs: Date.now() + navTotalDurationRef.current * 1000,
+      stationsAhead: currentInspectionStationsRef.current?.length || 0,
+      tollValue: navTollRef.current?.value ?? null,
+      tollCurrency: navTollRef.current?.currency ?? null
     });
 
     if (navPolylineRef.current) {
       mapInstance.current.removeObject(navPolylineRef.current);
     }
-    const polyline = new H.map.Polyline(H.geo.LineString.fromFlexiblePolyline(section.polyline), { style: SELECTED_ROUTE_STYLE });
+    const polyline = new H.map.Polyline(H.geo.LineString.fromFlexiblePolyline(section.polyline), { style: selectedRouteStyle() });
     mapInstance.current.addObject(polyline);
     navPolylineRef.current = polyline;
 
@@ -908,6 +976,8 @@ const MapView = ({ profile, onNavigatingChange }) => {
         routingMode: 'fast',
         return: 'polyline,summary,tolls,actions,instructions',
         spans: 'speedLimit,length,duration',
+        currency: 'CAD',
+        'tolls[summaries]': 'total',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
         'vehicle[height]': (profile?.height || 4) * 100,
         'vehicle[width]': (profile?.width || 2.5) * 100,
@@ -984,7 +1054,10 @@ const MapView = ({ profile, onNavigatingChange }) => {
     setTripStats({
       remainingKm: Math.max(0, totalLength - travelled) / 1000,
       remainingSeconds: Math.max(0, totalDuration - traveledDuration),
-      etaMs: Date.now() + Math.max(0, totalDuration - traveledDuration) * 1000
+      etaMs: Date.now() + Math.max(0, totalDuration - traveledDuration) * 1000,
+      stationsAhead: countStationsAhead(points, currentInspectionStationsRef.current, index),
+      tollValue: navTollRef.current?.value ?? null,
+      tollCurrency: navTollRef.current?.currency ?? null
     });
 
     updateProximityAlerts(currentPos, points, index, travelled);
@@ -1120,7 +1193,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
     const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
     if (selected) {
       routeOptions.forEach((opt) => {
-        opt.polyline.setStyle(opt.id === selectedRouteId ? SELECTED_ROUTE_STYLE : UNSELECTED_ROUTE_STYLE);
+        opt.polyline.setStyle(opt.id === selectedRouteId ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
       });
       mapInstance.current.addObjects(routeOptions.map((opt) => opt.polyline));
       updateStationsForRoute(selected.bounds);
@@ -1148,26 +1221,35 @@ const MapView = ({ profile, onNavigatingChange }) => {
               left: 0,
               right: 0,
               zIndex: 2500,
-              background: '#111827',
-              color: 'white',
-              padding: '16px 20px',
-              boxShadow: '0 2px 10px rgba(0,0,0,0.4)'
+              ...PANEL_STYLE,
+              borderTop: 'none',
+              borderLeft: 'none',
+              borderRight: 'none',
+              borderBottom: '1px solid var(--color-border)',
+              padding: '14px 20px 16px'
             }}
           >
             {currentInstruction ? (
               <>
-                <div style={{ fontSize: '20px', fontWeight: 'bold' }}>{currentInstruction.text}</div>
-                <div style={{ fontSize: '14px', color: '#93c5fd', marginTop: '2px' }}>
-                  In {formatDistance(currentInstruction.distanceMeters)}
+                <div style={{ ...LABEL_STYLE, display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+                  <span style={{ color: 'var(--color-route-normal)' }}>NEXT</span>
+                  <span>·</span>
+                  <span style={{ ...MONO_STYLE, fontSize: '12px', fontWeight: 700, textTransform: 'none', letterSpacing: 'normal', color: 'var(--color-text-primary)' }}>
+                    {formatDistance(currentInstruction.distanceMeters)}
+                  </span>
+                </div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '21px', fontWeight: 600, letterSpacing: '-0.01em', marginTop: '4px' }}>
+                  {currentInstruction.text}
                 </div>
                 {nextInstruction && (
-                  <div style={{ fontSize: '13px', color: '#9ca3af', marginTop: '6px' }}>
-                    Then {nextInstruction.text}
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginTop: '8px' }}>
+                    <span style={LABEL_STYLE}>THEN</span>
+                    <span style={{ fontFamily: 'var(--font-display)', fontSize: '13px', color: 'var(--color-text-muted)' }}>{nextInstruction.text}</span>
                   </div>
                 )}
               </>
             ) : (
-              <div style={{ fontSize: '16px' }}>Follow the highlighted route</div>
+              <div style={{ fontFamily: 'var(--font-display)', fontSize: '16px' }}>Follow the highlighted route</div>
             )}
           </div>
 
@@ -1175,18 +1257,22 @@ const MapView = ({ profile, onNavigatingChange }) => {
             <div
               style={{
                 position: 'absolute',
-                top: '110px',
+                top: '124px',
                 left: '50%',
                 transform: 'translateX(-50%)',
                 zIndex: 2500,
                 background: '#fbbf24',
                 color: '#78350f',
                 padding: '8px 16px',
-                borderRadius: '6px',
-                fontWeight: 'bold'
+                borderRadius: 'var(--radius-soft)',
+                fontFamily: 'var(--font-display)',
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+                fontSize: '13px',
+                fontWeight: 700
               }}
             >
-              Recalculating...
+              Recalculating…
             </div>
           )}
 
@@ -1194,33 +1280,35 @@ const MapView = ({ profile, onNavigatingChange }) => {
             <div
               style={{
                 position: 'absolute',
-                top: '96px',
+                top: '124px',
                 left: '16px',
                 zIndex: 2600,
                 maxWidth: '280px',
                 background: ALERT_STYLES[bannerAlert.kind].background,
                 color: ALERT_STYLES[bannerAlert.kind].color,
                 padding: '12px 16px',
-                borderRadius: '8px',
-                fontWeight: 'bold',
+                borderRadius: 'var(--radius-soft)',
+                fontFamily: 'var(--font-display)',
+                fontWeight: 700,
                 boxShadow: '0 4px 14px rgba(0,0,0,0.4)'
               }}
             >
-              ⚠️ {bannerAlert.name} - {Math.max(0, Math.round(bannerAlert.distanceMeters))}m ahead
+              ⚠️ {bannerAlert.name} — <span style={MONO_STYLE}>{Math.max(0, Math.round(bannerAlert.distanceMeters))}m</span> ahead
             </div>
           ) : toastAlert && (
             <div
               style={{
                 position: 'absolute',
-                top: '96px',
+                top: '124px',
                 left: '16px',
                 zIndex: 2600,
                 maxWidth: '280px',
-                background: 'white',
-                color: '#111827',
+                background: 'var(--color-panel)',
+                color: 'var(--color-text-primary)',
                 padding: '12px 36px 12px 14px',
-                borderRadius: '8px',
-                borderLeft: `6px solid ${ALERT_STYLES[toastAlert.kind].background}`,
+                borderRadius: 'var(--radius-soft)',
+                border: '1px solid var(--color-border)',
+                borderLeft: `4px solid ${ALERT_STYLES[toastAlert.kind].background}`,
                 boxShadow: '0 4px 14px rgba(0,0,0,0.3)'
               }}
             >
@@ -1233,7 +1321,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                   right: '8px',
                   border: 'none',
                   background: 'transparent',
-                  color: '#6b7280',
+                  color: 'var(--color-text-muted)',
                   fontSize: '14px',
                   fontWeight: 'bold',
                   cursor: 'pointer',
@@ -1242,7 +1330,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
               >
                 ✕
               </button>
-              <div style={{ fontSize: '14px', fontWeight: 'bold' }}>
+              <div style={{ fontFamily: 'var(--font-display)', fontSize: '14px', fontWeight: 700 }}>
                 Incoming: {toastAlert.name}
               </div>
             </div>
@@ -1252,17 +1340,20 @@ const MapView = ({ profile, onNavigatingChange }) => {
             onClick={stopNavigation}
             style={{
               position: 'absolute',
-              bottom: '30px',
+              bottom: '96px',
               left: '50%',
               transform: 'translateX(-50%)',
               zIndex: 2500,
-              padding: '14px 28px',
+              padding: '14px 32px',
               background: '#dc2626',
               color: 'white',
               border: 'none',
-              borderRadius: '30px',
-              fontWeight: 'bold',
-              fontSize: '15px',
+              borderRadius: 0,
+              fontFamily: 'var(--font-display)',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              fontWeight: 700,
+              fontSize: '14px',
               boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
               cursor: 'pointer'
             }}
@@ -1273,17 +1364,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
           <div ref={optionsMenuRef} style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 2700 }}>
             <button
               onClick={() => setOptionsMenuOpen((open) => !open)}
+              aria-label="Options menu"
               style={{
-                width: '40px',
-                height: '40px',
-                borderRadius: '50%',
-                border: 'none',
-                background: '#111827',
-                color: 'white',
-                fontSize: '20px',
-                fontWeight: 'bold',
+                width: '32px',
+                height: '32px',
+                borderRadius: 0,
+                border: '1px solid var(--color-border)',
+                background: 'var(--color-panel)',
+                color: 'var(--color-text-primary)',
+                fontSize: '18px',
+                fontWeight: 700,
                 cursor: 'pointer',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.4)'
+                boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
               }}
             >
               ⋮
@@ -1293,11 +1385,12 @@ const MapView = ({ profile, onNavigatingChange }) => {
               <div
                 style={{
                   position: 'absolute',
-                  top: '48px',
+                  top: '40px',
                   right: 0,
                   width: '210px',
-                  background: 'white',
-                  borderRadius: '8px',
+                  background: 'var(--color-panel)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: 0,
                   boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
                   overflow: 'hidden'
                 }}
@@ -1316,7 +1409,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 </button>
                 <button
                   onClick={() => setSpeedUnitMenuOpen((open) => !open)}
-                  style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid #eee' : 'none' }}
+                  style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid var(--color-border)' : 'none' }}
                 >
                   Speed Units {speedUnitMenuOpen ? '▲' : '▼'}
                 </button>
@@ -1328,8 +1421,8 @@ const MapView = ({ profile, onNavigatingChange }) => {
                       ...MENU_ITEM_STYLE,
                       paddingLeft: '26px',
                       fontSize: '12px',
-                      background: speedUnit === opt.value ? '#fff7ed' : 'white',
-                      fontWeight: speedUnit === opt.value ? 'bold' : 'normal'
+                      background: speedUnit === opt.value ? 'color-mix(in srgb, var(--color-route-normal) 15%, var(--color-panel))' : 'var(--color-panel)',
+                      fontWeight: speedUnit === opt.value ? 700 : 400
                     }}
                   >
                     {opt.label}
@@ -1342,26 +1435,28 @@ const MapView = ({ profile, onNavigatingChange }) => {
           <div
             style={{
               position: 'absolute',
-              top: '64px',
+              top: '56px',
               right: '16px',
               zIndex: 2600,
-              background: '#111827',
-              color: 'white',
-              borderRadius: '10px',
-              padding: '10px 14px',
-              boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+              ...PANEL_STYLE,
+              borderLeft: '3px solid var(--color-route-normal)',
+              padding: '10px 16px',
               textAlign: 'center',
-              minWidth: '110px'
+              minWidth: '110px',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
             }}
           >
-            <div style={{ fontSize: '22px', fontWeight: 'bold', lineHeight: 1.1 }}>
+            <div style={{ ...MONO_STYLE, fontSize: '26px', fontWeight: 700, lineHeight: 1.1 }}>
               {formatSpeedValue(currentSpeedMps, effectiveSpeedUnit)}
             </div>
-            <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '6px' }}>
+            <div style={{ ...LABEL_STYLE, marginBottom: '6px' }}>
               {unitLabel(effectiveSpeedUnit)}
             </div>
-            <div style={{ fontSize: '12px', color: '#93c5fd' }}>
-              Limit: {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
+            <div style={LABEL_STYLE}>
+              LIMIT{' '}
+              <span style={{ ...MONO_STYLE, textTransform: 'none', color: 'var(--color-text-primary)', fontWeight: 600 }}>
+                {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
+              </span>
             </div>
           </div>
 
@@ -1369,24 +1464,47 @@ const MapView = ({ profile, onNavigatingChange }) => {
             <div
               style={{
                 position: 'absolute',
-                bottom: '46px',
+                left: '16px',
                 right: '16px',
+                bottom: '16px',
                 zIndex: 2500,
-                background: 'rgba(17,24,39,0.8)',
-                color: 'white',
-                borderRadius: '10px',
-                padding: '10px 14px',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
-                minWidth: '150px',
-                fontSize: '13px',
-                lineHeight: '1.6'
+                display: 'flex',
+                ...PANEL_STYLE,
+                borderRadius: 'var(--radius-soft)',
+                borderLeft: '4px solid var(--color-route-normal)',
+                boxShadow: '0 2px 14px rgba(0,0,0,0.3)'
               }}
             >
-              <div>📍 Remaining: {tripStats.remainingKm.toFixed(0)} km</div>
-              <div>
-                🕐 ETA: {new Date(tripStats.etaMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-              </div>
-              <div>⏱ Time left: {formatDurationShort(tripStats.remainingSeconds)}</div>
+              {[
+                { label: 'DISTANCE', value: tripStats.remainingKm.toFixed(0), unit: 'KM' },
+                {
+                  label: 'ETA',
+                  value: new Date(tripStats.etaMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+                  unit: null
+                },
+                { label: 'MTO AHEAD', value: String(tripStats.stationsAhead ?? 0), unit: null },
+                {
+                  label: 'TOLL',
+                  value: tripStats.tollValue != null ? tripStats.tollValue.toFixed(2) : '—',
+                  unit: tripStats.tollValue != null ? tripStats.tollCurrency : null
+                }
+              ].map((col, i) => (
+                <div
+                  key={col.label}
+                  style={{
+                    flex: 1,
+                    padding: '10px 6px',
+                    textAlign: 'center',
+                    borderLeft: i > 0 ? '1px solid var(--color-grid-line)' : 'none'
+                  }}
+                >
+                  <div style={{ ...MONO_STYLE, fontSize: '17px', fontWeight: 700 }}>
+                    {col.value}
+                    {col.unit && <span style={{ ...LABEL_STYLE, marginLeft: '3px', fontSize: '10px' }}>{col.unit}</span>}
+                  </div>
+                  <div style={{ ...LABEL_STYLE, marginTop: '4px' }}>{col.label}</div>
+                </div>
+              ))}
             </div>
           )}
 
@@ -1395,9 +1513,9 @@ const MapView = ({ profile, onNavigatingChange }) => {
               onClick={() => setShowProfileModal(false)}
               style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
             >
-              <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '260px' }}>
-                <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>Vehicle Profile</h3>
-                <div style={{ fontSize: '13px', lineHeight: '1.8' }}>
+              <div onClick={(e) => e.stopPropagation()} style={{ ...PANEL_STYLE, padding: '20px', width: '260px' }}>
+                <h3 style={{ marginBottom: '12px', ...LABEL_STYLE, fontSize: '12px', color: 'var(--color-text-primary)' }}>Vehicle Profile</h3>
+                <div style={{ ...MONO_STYLE, fontSize: '13px', lineHeight: '1.8' }}>
                   <div>Height: {profile?.height || 'Not set'} m</div>
                   <div>Width: {profile?.width || 'Not set'} m</div>
                   <div>Length: {profile?.length || 'Not set'} m</div>
@@ -1407,7 +1525,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 </div>
                 <button
                   onClick={() => setShowProfileModal(false)}
-                  style={{ marginTop: '16px', width: '100%', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
+                  style={{ marginTop: '16px', width: '100%', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Close
                 </button>
@@ -1420,10 +1538,10 @@ const MapView = ({ profile, onNavigatingChange }) => {
               onClick={() => setShowMtoContactModal(false)}
               style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
             >
-              <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '260px' }}>
-                <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>MTO Contact Info</h3>
-                <div style={{ fontSize: '13px', lineHeight: '1.8' }}>
-                  <div><strong>Phone:</strong> <a href={`tel:${PROVINCE_PERMITS.Ontario.phone}`}>{PROVINCE_PERMITS.Ontario.phone}</a></div>
+              <div onClick={(e) => e.stopPropagation()} style={{ ...PANEL_STYLE, padding: '20px', width: '260px' }}>
+                <h3 style={{ marginBottom: '12px', ...LABEL_STYLE, fontSize: '12px', color: 'var(--color-text-primary)' }}>MTO Contact Info</h3>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '13px', lineHeight: '1.8' }}>
+                  <div><strong>Phone:</strong> <a href={`tel:${PROVINCE_PERMITS.Ontario.phone}`} style={{ ...MONO_STYLE, color: 'var(--color-text-primary)' }}>{PROVINCE_PERMITS.Ontario.phone}</a></div>
                   <div><strong>Permits:</strong> {PROVINCE_PERMITS.Ontario.permitRequired}</div>
                   <div><strong>Escort:</strong> {PROVINCE_PERMITS.Ontario.escort}</div>
                 </div>
@@ -1431,13 +1549,13 @@ const MapView = ({ profile, onNavigatingChange }) => {
                   href={PROVINCE_PERMITS.Ontario.portalUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{ display: 'block', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: '6px', textDecoration: 'none', fontWeight: 'bold' }}
+                  style={{ display: 'block', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: 0, textDecoration: 'none', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Open Permit Portal
                 </a>
                 <button
                   onClick={() => setShowMtoContactModal(false)}
-                  style={{ marginTop: '10px', width: '100%', padding: '8px', background: '#eee', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+                  style={{ marginTop: '10px', width: '100%', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
                 >
                   Close
                 </button>
@@ -1453,10 +1571,10 @@ const MapView = ({ profile, onNavigatingChange }) => {
           top: 20,
           left: 20,
           zIndex: 2000,
-          background: 'white',
+          ...PANEL_STYLE,
+          borderRadius: 'var(--radius-soft)',
           padding: '16px',
-          borderRadius: '10px',
-          boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
           width: '280px'
         }}
       >
@@ -1465,17 +1583,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
             onClick={() => setShowRouteDropdown((open) => !open)}
             style={{
               width: '100%',
-              padding: '8px',
-              background: '#f3f4f6',
-              border: '1px solid #ccc',
-              borderRadius: '4px',
+              padding: '8px 10px',
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 0,
               cursor: 'pointer',
+              fontFamily: 'var(--font-display)',
               fontSize: '13px',
-              fontWeight: 'bold',
+              fontWeight: 600,
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
-              color: '#374151'
+              color: 'var(--color-text-primary)'
             }}
           >
             <span>Select Previous Route</span>
@@ -1490,9 +1609,9 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 left: 0,
                 right: 0,
                 zIndex: 2100,
-                background: 'white',
-                border: '1px solid #ccc',
-                borderRadius: '6px',
+                background: 'var(--color-panel)',
+                border: '1px solid var(--color-border)',
+                borderRadius: 0,
                 boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
                 marginTop: '4px',
                 maxHeight: '340px',
@@ -1505,19 +1624,19 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 placeholder="Search saved routes..."
                 value={routeSearchQuery}
                 onChange={(e) => setRouteSearchQuery(e.target.value)}
-                style={{ width: '100%', padding: '6px 8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box', marginBottom: '8px', fontSize: '12px' }}
+                style={{ width: '100%', padding: '6px 8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '8px', fontSize: '12px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
               />
 
               {!trimmedRouteSearch && (
-                <div style={{ fontSize: '11px', color: '#888', fontWeight: 'bold', marginBottom: '4px', textTransform: 'uppercase' }}>
+                <div style={{ ...LABEL_STYLE, marginBottom: '4px' }}>
                   {routeDropdownExpanded ? 'All Saved Routes' : 'Most Used'}
                 </div>
               )}
 
               {savedRoutes.length === 0 ? (
-                <div style={{ fontSize: '12px', color: '#888', padding: '10px', textAlign: 'center' }}>No saved routes yet</div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)', padding: '10px', textAlign: 'center' }}>No saved routes yet</div>
               ) : displayedSavedRoutes.length === 0 ? (
-                <div style={{ fontSize: '12px', color: '#888', padding: '10px', textAlign: 'center' }}>No routes match "{routeSearchQuery}"</div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)', padding: '10px', textAlign: 'center' }}>No routes match "{routeSearchQuery}"</div>
               ) : (
                 displayedSavedRoutes.map((route) => (
                   <button
@@ -1529,18 +1648,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
                       textAlign: 'left',
                       padding: '8px',
                       marginBottom: '4px',
-                      border: '1px solid #eee',
-                      borderRadius: '6px',
-                      background: 'white',
+                      border: '1px solid var(--color-border)',
+                      borderRadius: 0,
+                      background: 'var(--color-panel)',
                       cursor: 'pointer',
-                      fontFamily: 'inherit'
+                      fontFamily: 'var(--font-display)'
                     }}
                   >
-                    <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#111827' }}>{route.route_name}</div>
-                    <div style={{ fontSize: '11px', color: '#555', marginTop: '2px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--color-text-primary)' }}>{route.route_name}</div>
+                    <div style={{ fontFamily: 'var(--font-display)', fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
                       {route.start_location} → {route.end_location}
                     </div>
-                    <div style={{ fontSize: '11px', color: '#888', marginTop: '2px', display: 'flex', justifyContent: 'space-between' }}>
+                    <div style={{ ...MONO_STYLE, fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px', display: 'flex', justifyContent: 'space-between' }}>
                       <span>{route.distance != null ? `${route.distance} km` : ''}</span>
                       <span>{route.last_used ? `Last used ${new Date(route.last_used).toLocaleDateString()}` : 'Never used'}</span>
                     </div>
@@ -1551,7 +1670,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
               {!trimmedRouteSearch && !routeDropdownExpanded && savedRoutes.length > 3 && (
                 <button
                   onClick={() => setRouteDropdownExpanded(true)}
-                  style={{ width: '100%', padding: '6px', background: 'transparent', border: 'none', color: '#e85d04', fontWeight: 'bold', fontSize: '12px', cursor: 'pointer' }}
+                  style={{ width: '100%', padding: '6px', background: 'transparent', border: 'none', color: '#e85d04', fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '12px', cursor: 'pointer' }}
                 >
                   See more ({savedRoutes.length - 3} more)
                 </button>
@@ -1566,7 +1685,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
             placeholder="Start location"
             value={startLocation}
             onChange={handleStartChange}
-            style={{ width: '100%', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box' }}
+            style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
           {(startSuggestLoading || startSuggestions.length > 0) && (
             <div
@@ -1578,15 +1697,15 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 left: 0,
                 right: 0,
                 zIndex: 9999,
-                background: 'white',
-                border: '1px solid #ccc',
-                borderRadius: '4px',
+                background: 'var(--color-panel)',
+                border: '1px solid var(--color-border)',
+                borderRadius: 0,
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
                 marginTop: '2px'
               }}
             >
               {startSuggestLoading ? (
-                <div style={{ padding: '8px', fontSize: '12px', color: '#888' }}>Searching…</div>
+                <div style={{ padding: '8px', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
               ) : (
                 startSuggestions.map((item) => (
                   <div
@@ -1595,7 +1714,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                       e.preventDefault();
                       selectStartSuggestion(item);
                     }}
-                    style={{ padding: '8px', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid #eee' }}
+                    style={{ padding: '8px', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
                   >
                     {formatSuggestion(item)}
                   </div>
@@ -1610,7 +1729,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
             placeholder="End location"
             value={endLocation}
             onChange={handleEndChange}
-            style={{ width: '100%', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box' }}
+            style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
           {(endSuggestLoading || endSuggestions.length > 0) && (
             <div
@@ -1622,15 +1741,15 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 left: 0,
                 right: 0,
                 zIndex: 9999,
-                background: 'white',
-                border: '1px solid #ccc',
-                borderRadius: '4px',
+                background: 'var(--color-panel)',
+                border: '1px solid var(--color-border)',
+                borderRadius: 0,
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
                 marginTop: '2px'
               }}
             >
               {endSuggestLoading ? (
-                <div style={{ padding: '8px', fontSize: '12px', color: '#888' }}>Searching…</div>
+                <div style={{ padding: '8px', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
               ) : (
                 endSuggestions.map((item) => (
                   <div
@@ -1639,7 +1758,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                       e.preventDefault();
                       selectEndSuggestion(item);
                     }}
-                    style={{ padding: '8px', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid #eee' }}
+                    style={{ padding: '8px', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
                   >
                     {formatSuggestion(item)}
                   </div>
@@ -1657,12 +1776,15 @@ const MapView = ({ profile, onNavigatingChange }) => {
             background: searching ? '#aaa' : '#e85d04',
             color: 'white',
             border: 'none',
-            borderRadius: '4px',
+            borderRadius: 0,
             cursor: searching ? 'not-allowed' : 'pointer',
-            fontWeight: 'bold'
+            fontFamily: 'var(--font-display)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+            fontWeight: 700
           }}
         >
-          {searching ? 'Calculating...' : 'Find Truck Route'}
+          {searching ? 'Calculating…' : 'Find Truck Route'}
         </button>
         {routeOptions.length > 0 && (
           <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -1673,18 +1795,19 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 style={{
                   textAlign: 'left',
                   padding: '10px 12px',
-                  borderRadius: '8px',
-                  border: opt.id === selectedRouteId ? '2px solid #e85d04' : '1px solid #ddd',
-                  background: opt.id === selectedRouteId ? '#fff7ed' : 'white',
+                  borderRadius: 0,
+                  border: '1px solid var(--color-border)',
+                  borderLeft: opt.id === selectedRouteId ? '3px solid var(--color-route-normal)' : '1px solid var(--color-border)',
+                  background: 'var(--color-panel)',
                   cursor: 'pointer',
-                  fontFamily: 'inherit'
+                  fontFamily: 'var(--font-display)'
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontWeight: 'bold', fontSize: '13px' }}>{opt.label}</span>
+                  <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--color-text-primary)' }}>{opt.label}</span>
                   <span style={{ fontSize: '15px' }}>{opt.hasTolls ? '🏷️' : '✅'}</span>
                 </div>
-                <div style={{ fontSize: '12px', color: '#555', marginTop: '2px' }}>
+                <div style={{ ...MONO_STYLE, fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
                   {opt.km} km · {opt.durationText}
                 </div>
               </button>
@@ -1698,12 +1821,15 @@ const MapView = ({ profile, onNavigatingChange }) => {
               width: '100%',
               marginTop: '10px',
               padding: '10px',
-              background: 'white',
+              background: 'var(--color-panel)',
               color: '#e85d04',
               border: '1px solid #e85d04',
-              borderRadius: '4px',
+              borderRadius: 0,
               cursor: 'pointer',
-              fontWeight: 'bold'
+              fontFamily: 'var(--font-display)',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              fontWeight: 700
             }}
           >
             Save This Route
@@ -1716,12 +1842,15 @@ const MapView = ({ profile, onNavigatingChange }) => {
               width: '100%',
               marginTop: '10px',
               padding: '10px',
-              background: '#16a34a',
+              background: 'var(--color-route-normal)',
               color: 'white',
               border: 'none',
-              borderRadius: '4px',
+              borderRadius: 0,
               cursor: 'pointer',
-              fontWeight: 'bold'
+              fontFamily: 'var(--font-display)',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              fontWeight: 700
             }}
           >
             Start Navigation
@@ -1734,17 +1863,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
               padding: '8px',
               background: '#fef3c7',
               border: '1px solid #f59e0b',
-              borderRadius: '4px',
+              borderRadius: 'var(--radius-soft)',
               color: '#92400e',
+              fontFamily: 'var(--font-display)',
               fontSize: '13px',
-              fontWeight: 'bold'
+              fontWeight: 700
             }}
           >
             ⚠️ {inspectionStationCount} MTO inspection station{inspectionStationCount === 1 ? '' : 's'} on this route — stay alert for flashing signs
           </div>
         )}
         {error && (
-          <div style={{ marginTop: '8px', color: '#c0392b' }}>{error}</div>
+          <div style={{ marginTop: '8px', fontFamily: 'var(--font-display)', color: '#c0392b' }}>{error}</div>
         )}
       </div>
       )}
@@ -1753,23 +1883,23 @@ const MapView = ({ profile, onNavigatingChange }) => {
           onClick={() => setShowSaveRouteModal(false)}
           style={{ position: 'absolute', inset: 0, zIndex: 3000, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
         >
-          <div onClick={(e) => e.stopPropagation()} style={{ background: 'white', borderRadius: '10px', padding: '20px', width: '280px' }}>
-            <h3 style={{ marginBottom: '12px', fontSize: '16px' }}>Save This Route</h3>
+          <div onClick={(e) => e.stopPropagation()} style={{ ...PANEL_STYLE, padding: '20px', width: '280px' }}>
+            <h3 style={{ marginBottom: '12px', ...LABEL_STYLE, fontSize: '12px', color: 'var(--color-text-primary)' }}>Save This Route</h3>
             <input
               type="text"
               placeholder="Route name"
               value={saveRouteName}
               onChange={(e) => setSaveRouteName(e.target.value)}
               autoFocus
-              style={{ width: '100%', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', boxSizing: 'border-box', marginBottom: '10px' }}
+              style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '10px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
             />
             {saveRouteError && (
-              <div style={{ color: '#c0392b', fontSize: '12px', marginBottom: '8px' }}>{saveRouteError}</div>
+              <div style={{ color: '#c0392b', fontFamily: 'var(--font-display)', fontSize: '12px', marginBottom: '8px' }}>{saveRouteError}</div>
             )}
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
                 onClick={() => setShowSaveRouteModal(false)}
-                style={{ flex: 1, padding: '8px', background: '#eee', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+                style={{ flex: 1, padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
               >
                 Cancel
               </button>
@@ -1779,15 +1909,18 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 style={{
                   flex: 1,
                   padding: '8px',
-                  background: savingRoute ? '#aaa' : '#16a34a',
+                  background: savingRoute ? '#aaa' : 'var(--color-route-normal)',
                   color: 'white',
                   border: 'none',
-                  borderRadius: '6px',
+                  borderRadius: 0,
                   cursor: savingRoute ? 'not-allowed' : 'pointer',
-                  fontWeight: 'bold'
+                  fontFamily: 'var(--font-display)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  fontWeight: 700
                 }}
               >
-                {savingRoute ? 'Saving...' : 'Save'}
+                {savingRoute ? 'Saving…' : 'Save'}
               </button>
             </div>
           </div>
@@ -1816,12 +1949,14 @@ const MapView = ({ profile, onNavigatingChange }) => {
                   flex: '0 0 240px',
                   background: permit.color,
                   color: 'white',
-                  borderRadius: '10px',
+                  borderRadius: 0,
                   padding: '14px',
+                  fontFamily: 'var(--font-display)',
                   boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
                 }}
               >
-                <div style={{ fontSize: '15px', fontWeight: 'bold', marginBottom: '8px' }}>
+                <div style={{ ...LABEL_STYLE, color: 'rgba(255,255,255,0.75)', marginBottom: '4px' }}>Province</div>
+                <div style={{ fontSize: '16px', fontWeight: 700, marginBottom: '8px' }}>
                   {permit.name}
                 </div>
                 <div style={{ fontSize: '12px', marginBottom: '6px' }}>
@@ -1835,7 +1970,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
                 </div>
                 <div style={{ fontSize: '12px', marginBottom: '10px' }}>
                   <strong>Phone:</strong>{' '}
-                  <a href={`tel:${permit.phone}`} style={{ color: 'white' }}>{permit.phone}</a>
+                  <a href={`tel:${permit.phone}`} style={{ ...MONO_STYLE, color: 'white' }}>{permit.phone}</a>
                 </div>
                 <a
                   href={permit.portalUrl}
@@ -1846,9 +1981,11 @@ const MapView = ({ profile, onNavigatingChange }) => {
                     textAlign: 'center',
                     padding: '8px',
                     background: 'rgba(255,255,255,0.2)',
-                    borderRadius: '6px',
+                    borderRadius: 0,
                     color: 'white',
-                    fontWeight: 'bold',
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.05em',
                     fontSize: '12px',
                     textDecoration: 'none'
                   }}
@@ -1861,6 +1998,7 @@ const MapView = ({ profile, onNavigatingChange }) => {
         </div>
       )}
       <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
+      {gridOverlay === 'on' && <div className="mt-grid-overlay" />}
     </div>
   );
 };
