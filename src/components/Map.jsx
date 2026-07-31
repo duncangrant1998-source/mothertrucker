@@ -230,7 +230,7 @@ const buildCumulativeSpanDurations = (points, spans, cumulativeDistance, totalDu
 // the driver is currently on.
 const speedLimitAtIndex = (spans, index) => {
   for (let s = spans.length - 1; s >= 0; s--) {
-    if (spans[s].offset <= index) return spans[s].speedLimit?.maxSpeed ?? null;
+    if (spans[s].offset <= index) return spans[s].speedLimit ?? null;
   }
   return null;
 };
@@ -912,7 +912,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         destination: `${end.lat},${end.lng}`,
         transportMode: 'truck',
         return: 'polyline,summary,tolls,actions,instructions',
-        spans: 'speedLimit,length,duration',
+        spans: 'maxSpeed,length,duration',
         currency: 'CAD',
         'tolls[summaries]': 'total',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
@@ -1131,7 +1131,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         transportMode: 'truck',
         routingMode: 'fast',
         return: 'polyline,summary,tolls,actions,instructions',
-        spans: 'speedLimit,length,duration',
+        spans: 'maxSpeed,length,duration',
         currency: 'CAD',
         'tolls[summaries]': 'total',
         'vehicle[grossWeight]': (profile?.weight || 25000) * 1000,
