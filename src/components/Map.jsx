@@ -154,8 +154,11 @@ const SPEED_UNIT_OPTIONS = [
 ];
 
 const MENU_ITEM_STYLE = {
-  display: 'block',
+  display: 'flex',
+  alignItems: 'center',
   width: '100%',
+  minHeight: '44px',
+  boxSizing: 'border-box',
   textAlign: 'left',
   padding: '10px 14px',
   border: 'none',
@@ -299,6 +302,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const alertStateRef = useRef(new Map());
   const toastTimeoutRef = useRef(null);
   const autoUnitIntervalRef = useRef(null);
+  const wakeLockRef = useRef(null);
   const optionsMenuRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
@@ -531,6 +535,51 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     autoUnitIntervalRef.current = setInterval(detectUnit, 3 * 60 * 1000);
     return () => {
       if (autoUnitIntervalRef.current) clearInterval(autoUnitIntervalRef.current);
+    };
+  }, [navigating]);
+
+  // Keeps the screen on for the duration of active turn-by-turn navigation —
+  // a phone mounted in the cab would otherwise sleep mid-route. Unsupported
+  // browsers (no navigator.wakeLock) are left alone entirely: navigation still
+  // works, the screen just won't be forced awake. The OS/browser silently
+  // releases the lock whenever the tab is backgrounded (app switch, screen
+  // lock) without restoring it automatically, so a visibilitychange listener
+  // re-requests it once the tab is foregrounded again if still navigating.
+  useEffect(() => {
+    if (!navigating || !('wakeLock' in navigator)) return;
+
+    let cancelled = false;
+
+    const requestWakeLock = async () => {
+      try {
+        const lock = await navigator.wakeLock.request('screen');
+        if (cancelled) {
+          lock.release().catch(() => {});
+          return;
+        }
+        wakeLockRef.current = lock;
+        lock.addEventListener('release', () => {
+          if (wakeLockRef.current === lock) wakeLockRef.current = null;
+        });
+      } catch (err) {
+        console.error('Wake Lock request failed:', err);
+      }
+    };
+
+    requestWakeLock();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && !wakeLockRef.current) {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      wakeLockRef.current?.release().catch(() => {});
+      wakeLockRef.current = null;
     };
   }, [navigating]);
 
@@ -1271,6 +1320,41 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <style>{`
+        @media (max-width: 480px) {
+          .mt-route-card {
+            left: 12px !important;
+            right: 12px !important;
+            top: 84px !important;
+            width: auto !important;
+            max-height: calc(100vh - 100px) !important;
+            overflow-y: auto !important;
+          }
+          .mt-route-card.mt-has-permits {
+            /* Leaves room below for the bottom-anchored permit strip
+               (230px reserved height + gaps) so the two never overlap. */
+            max-height: max(160px, calc(100vh - 354px)) !important;
+          }
+          .mt-permit-panel {
+            left: 12px !important;
+            right: 12px !important;
+          }
+          .mt-trip-stats {
+            flex-wrap: wrap;
+          }
+          .mt-trip-stats > div {
+            flex: 1 1 50% !important;
+            box-sizing: border-box;
+          }
+          .mt-trip-stats > div:nth-child(3) {
+            border-left: none !important;
+            border-top: 1px solid var(--color-grid-line);
+          }
+          .mt-trip-stats > div:nth-child(4) {
+            border-top: 1px solid var(--color-grid-line);
+          }
+        }
+      `}</style>
       {navigating && (
         <>
           <div
@@ -1364,7 +1448,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 maxWidth: '280px',
                 background: 'var(--color-panel)',
                 color: 'var(--color-text-primary)',
-                padding: '12px 36px 12px 14px',
+                padding: '12px 44px 12px 14px',
                 borderRadius: 'var(--radius-soft)',
                 border: '1px solid var(--color-border)',
                 borderLeft: `4px solid ${ALERT_STYLES[toastAlert.kind].background}`,
@@ -1376,8 +1460,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 aria-label="Dismiss alert"
                 style={{
                   position: 'absolute',
-                  top: '6px',
-                  right: '8px',
+                  top: 0,
+                  right: 0,
+                  width: '44px',
+                  height: '44px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                   border: 'none',
                   background: 'transparent',
                   color: 'var(--color-text-muted)',
@@ -1403,6 +1492,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               left: '50%',
               transform: 'translateX(-50%)',
               zIndex: 2500,
+              minHeight: '44px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxSizing: 'border-box',
               padding: '14px 32px',
               background: '#dc2626',
               color: 'white',
@@ -1425,8 +1519,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               onClick={() => setOptionsMenuOpen((open) => !open)}
               aria-label="Options menu"
               style={{
-                width: '32px',
-                height: '32px',
+                width: '44px',
+                height: '44px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
                 borderRadius: 0,
                 border: '1px solid var(--color-border)',
                 background: 'var(--color-panel)',
@@ -1444,7 +1541,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               <div
                 style={{
                   position: 'absolute',
-                  top: '40px',
+                  top: '48px',
                   right: 0,
                   width: '210px',
                   background: 'var(--color-panel)',
@@ -1494,7 +1591,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           <div
             style={{
               position: 'absolute',
-              top: '56px',
+              top: '68px',
               right: '16px',
               zIndex: 2600,
               ...PANEL_STYLE,
@@ -1521,6 +1618,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
           {tripStats && (
             <div
+              className="mt-trip-stats"
               style={{
                 position: 'absolute',
                 left: '16px',
@@ -1584,7 +1682,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 </div>
                 <button
                   onClick={() => setShowProfileModal(false)}
-                  style={{ marginTop: '16px', width: '100%', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
+                  style={{ marginTop: '16px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Close
                 </button>
@@ -1608,13 +1706,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   href={PROVINCE_PERMITS.Ontario.portalUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{ display: 'block', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: 0, textDecoration: 'none', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '44px', boxSizing: 'border-box', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: 0, textDecoration: 'none', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Open Permit Portal
                 </a>
                 <button
                   onClick={() => setShowMtoContactModal(false)}
-                  style={{ marginTop: '10px', width: '100%', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
+                  style={{ marginTop: '10px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
                 >
                   Close
                 </button>
@@ -1625,6 +1723,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       )}
       {!navigating && (
       <div
+        className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
         style={{
           position: 'absolute',
           top: 20,
@@ -1642,10 +1741,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onClick={() => setShowRouteDropdown((open) => !open)}
             style={{
               width: '100%',
+              minHeight: '44px',
+              boxSizing: 'border-box',
               padding: '8px 10px',
               background: 'var(--color-bg)',
               border: '1px solid var(--color-border)',
-              borderRadius: 0,
+              borderRadius: 'var(--radius-soft)',
               cursor: 'pointer',
               fontFamily: 'var(--font-display)',
               fontSize: '13px',
@@ -1670,7 +1771,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 zIndex: 2100,
                 background: 'var(--color-panel)',
                 border: '1px solid var(--color-border)',
-                borderRadius: 0,
+                borderRadius: 'var(--radius-soft)',
                 boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
                 marginTop: '4px',
                 maxHeight: '340px',
@@ -1683,7 +1784,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 placeholder="Search saved routes..."
                 value={routeSearchQuery}
                 onChange={(e) => setRouteSearchQuery(e.target.value)}
-                style={{ width: '100%', padding: '6px 8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '8px', fontSize: '12px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
+                style={{ width: '100%', minHeight: '44px', padding: '6px 8px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', marginBottom: '8px', fontSize: '12px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
               />
 
               {!trimmedRouteSearch && (
@@ -1704,11 +1805,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                     style={{
                       display: 'block',
                       width: '100%',
+                      minHeight: '44px',
+                      boxSizing: 'border-box',
                       textAlign: 'left',
                       padding: '8px',
                       marginBottom: '4px',
                       border: '1px solid var(--color-border)',
-                      borderRadius: 0,
+                      borderRadius: 'var(--radius-soft)',
                       background: 'var(--color-panel)',
                       cursor: 'pointer',
                       fontFamily: 'var(--font-display)'
@@ -1729,7 +1832,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               {!trimmedRouteSearch && !routeDropdownExpanded && savedRoutes.length > 3 && (
                 <button
                   onClick={() => setRouteDropdownExpanded(true)}
-                  style={{ width: '100%', padding: '6px', background: 'transparent', border: 'none', color: '#e85d04', fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '12px', cursor: 'pointer' }}
+                  style={{ width: '100%', minHeight: '44px', boxSizing: 'border-box', padding: '6px', background: 'transparent', border: 'none', color: '#e85d04', fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '12px', cursor: 'pointer' }}
                 >
                   See more ({savedRoutes.length - 3} more)
                 </button>
@@ -1744,7 +1847,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             placeholder="Start location"
             value={startLocation}
             onChange={handleStartChange}
-            style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
+            style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
           {(startSuggestLoading || startSuggestions.length > 0) && (
             <div
@@ -1755,10 +1858,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 top: '100%',
                 left: 0,
                 right: 0,
-                zIndex: 9999,
+                zIndex: 2200,
                 background: 'var(--color-panel)',
                 border: '1px solid var(--color-border)',
-                borderRadius: 0,
+                borderRadius: 'var(--radius-soft)',
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
                 marginTop: '2px'
               }}
@@ -1773,7 +1876,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                       e.preventDefault();
                       selectStartSuggestion(item);
                     }}
-                    style={{ padding: '8px', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
+                    style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
                   >
                     {formatSuggestion(item)}
                   </div>
@@ -1788,7 +1891,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             placeholder="End location"
             value={endLocation}
             onChange={handleEndChange}
-            style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
+            style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
           {(endSuggestLoading || endSuggestions.length > 0) && (
             <div
@@ -1799,10 +1902,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 top: '100%',
                 left: 0,
                 right: 0,
-                zIndex: 9999,
+                zIndex: 2200,
                 background: 'var(--color-panel)',
                 border: '1px solid var(--color-border)',
-                borderRadius: 0,
+                borderRadius: 'var(--radius-soft)',
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
                 marginTop: '2px'
               }}
@@ -1817,7 +1920,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                       e.preventDefault();
                       selectEndSuggestion(item);
                     }}
-                    style={{ padding: '8px', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
+                    style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
                   >
                     {formatSuggestion(item)}
                   </div>
@@ -1831,6 +1934,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           disabled={searching}
           style={{
             width: '100%',
+            minHeight: '44px',
+            boxSizing: 'border-box',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
             padding: '10px',
             background: searching ? '#aaa' : '#e85d04',
             color: 'white',
@@ -1853,6 +1961,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 onClick={() => selectRoute(opt.id)}
                 style={{
                   textAlign: 'left',
+                  minHeight: '44px',
+                  boxSizing: 'border-box',
                   padding: '10px 12px',
                   borderRadius: 0,
                   border: '1px solid var(--color-border)',
@@ -1878,6 +1988,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onClick={() => { setSaveRouteName(''); setSaveRouteError(''); setShowSaveRouteModal(true); }}
             style={{
               width: '100%',
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               marginTop: '10px',
               padding: '10px',
               background: 'var(--color-panel)',
@@ -1899,6 +2014,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onClick={startNavigation}
             style={{
               width: '100%',
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               marginTop: '10px',
               padding: '10px',
               background: 'var(--color-route-normal)',
@@ -1950,7 +2070,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               value={saveRouteName}
               onChange={(e) => setSaveRouteName(e.target.value)}
               autoFocus
-              style={{ width: '100%', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '10px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
+              style={{ width: '100%', minHeight: '44px', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '10px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
             />
             {saveRouteError && (
               <div style={{ color: '#c0392b', fontFamily: 'var(--font-display)', fontSize: '12px', marginBottom: '8px' }}>{saveRouteError}</div>
@@ -1958,7 +2078,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
                 onClick={() => setShowSaveRouteModal(false)}
-                style={{ flex: 1, padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
+                style={{ flex: 1, minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
               >
                 Cancel
               </button>
@@ -1967,6 +2087,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 disabled={savingRoute}
                 style={{
                   flex: 1,
+                  minHeight: '44px',
+                  boxSizing: 'border-box',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                   padding: '8px',
                   background: savingRoute ? '#aaa' : 'var(--color-route-normal)',
                   color: 'white',
@@ -1987,15 +2112,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       )}
       {!navigating && provincesOnRoute.length > 0 && (
         <div
+          className="mt-permit-panel"
           style={{
             position: 'absolute',
             bottom: '20px',
             left: '20px',
             right: '20px',
-            zIndex: 2000,
+            // Below the route search card (2000) so the card's inputs and
+            // "Find Truck Route" button stay tappable if the two ever touch.
+            zIndex: 1900,
             display: 'flex',
             gap: '12px',
+            maxHeight: '230px',
             overflowX: 'auto',
+            overflowY: 'auto',
             paddingBottom: '4px'
           }}
         >
@@ -2036,8 +2166,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   target="_blank"
                   rel="noopener noreferrer"
                   style={{
-                    display: 'block',
-                    textAlign: 'center',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    minHeight: '44px',
+                    boxSizing: 'border-box',
                     padding: '8px',
                     background: 'rgba(255,255,255,0.2)',
                     borderRadius: 0,

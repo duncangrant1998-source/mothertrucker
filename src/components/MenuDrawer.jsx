@@ -50,6 +50,15 @@ export default function MenuDrawer({ children }) {
         .mt-hamburger:hover { background: var(--color-bg); }
         .mt-close-btn:hover { background: var(--color-bg); color: var(--color-text-primary); }
         .mt-signout-btn:hover:not(:disabled) { background: var(--color-bg); }
+        @media (max-width: 480px) {
+          .mt-drawer {
+            left: 12px !important;
+            right: 12px !important;
+            top: 12px !important;
+            width: auto !important;
+            max-width: none !important;
+          }
+        }
       `}</style>
 
       {/* Hamburger button — always visible, top right */}
@@ -61,7 +70,7 @@ export default function MenuDrawer({ children }) {
           position: 'fixed',
           top: '16px',
           right: '16px',
-          zIndex: 1000,
+          zIndex: 4000,
           width: '56px',
           height: '56px',
           display: 'flex',
@@ -85,17 +94,18 @@ export default function MenuDrawer({ children }) {
       {open && (
         <div
           onClick={() => setOpen(false)}
-          style={{ position: 'fixed', inset: 0, zIndex: 1001, background: 'rgba(0,0,0,0.3)' }}
+          style={{ position: 'fixed', inset: 0, zIndex: 4001, background: 'rgba(0,0,0,0.3)' }}
         />
       )}
 
       {/* Drawer */}
       <aside
+        className="mt-drawer"
         style={{
           position: 'fixed',
           top: '16px',
           right: '16px',
-          zIndex: 1002,
+          zIndex: 4002,
           display: 'flex',
           height: 'auto',
           maxHeight: 'calc(100vh - 32px)',
@@ -122,10 +132,14 @@ export default function MenuDrawer({ children }) {
             aria-label="Close menu"
             className="mt-close-btn"
             style={{
+              width: '44px',
+              height: '44px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               borderRadius: 0,
               border: 'none',
               background: 'transparent',
-              padding: '4px',
               fontSize: '24px',
               lineHeight: 1,
               color: 'var(--color-text-muted)',
@@ -153,6 +167,11 @@ export default function MenuDrawer({ children }) {
             className="mt-signout-btn"
             style={{
               width: '100%',
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               borderRadius: 0,
               border: '1px solid var(--color-border)',
               padding: '10px 16px',

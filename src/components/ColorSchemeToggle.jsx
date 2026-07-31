@@ -9,6 +9,11 @@ const LABEL_STYLE = {
 
 const segmentStyle = (active) => ({
   flex: 1,
+  minHeight: '44px',
+  boxSizing: 'border-box',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
   padding: '10px',
   border: 'none',
   background: active ? '#e85d04' : 'var(--color-panel)',

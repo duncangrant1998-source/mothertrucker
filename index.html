@@ -4,7 +4,22 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Truck Nav</title>
+    <title>Mother Trucker</title>
+
+    <!-- PWA: installable, opens standalone (no browser chrome) from the home
+         screen. content="#e85d04" is just the pre-JS fallback (light scheme,
+         matches manifest.json's theme_color) — App.jsx overwrites it once
+         mounted to track the app's actual effective scheme, including a
+         manual drawer override, which a media="(prefers-color-scheme)" meta
+         can't react to since that only follows the OS preference. A single
+         tag with no media attribute (rather than a light/dark pair) so
+         App.jsx's override isn't fighting the browser over which tag wins. -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" id="theme-color-meta" content="#e85d04" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Mother Trucker" />
 
     <!-- Industrial Precision typography -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />

@@ -69,6 +69,15 @@ function App() {
 
   const effectiveColorScheme = manualColorScheme ?? (systemPrefersDark ? 'dark' : 'light');
 
+  // Keeps the browser/OS chrome (status bar tint, task switcher card) matching
+  // the app's actual displayed scheme — including a manual drawer override,
+  // which index.html's static <meta name="theme-color"> can't react to on
+  // its own since it has no way to know about anything but the OS preference.
+  useEffect(() => {
+    const meta = document.getElementById('theme-color-meta');
+    if (meta) meta.setAttribute('content', effectiveColorScheme === 'dark' ? '#1F2327' : '#e85d04');
+  }, [effectiveColorScheme]);
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user || null);

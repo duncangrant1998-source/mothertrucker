@@ -15,6 +15,7 @@ const LABEL_STYLE = {
 
 const INPUT_STYLE = {
   width: '100%',
+  minHeight: '44px',
   padding: '7px 8px',
   border: '1px solid var(--color-border)',
   borderRadius: 0,
@@ -118,6 +119,8 @@ const VehicleProfile = ({ onProfileUpdate }) => {
           alignItems: 'center',
           justifyContent: 'space-between',
           width: '100%',
+          minHeight: '44px',
+          boxSizing: 'border-box',
           marginBottom: '12px',
           padding: 0,
           border: 'none',
@@ -194,6 +197,11 @@ const VehicleProfile = ({ onProfileUpdate }) => {
             disabled={loading}
             style={{
               width: '100%',
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               padding: '10px',
               background: '#e85d04',
               color: 'white',
