@@ -46,9 +46,11 @@ const getSatelliteLayers = (defaultLayers, colorScheme) => (
     : { base: defaultLayers.hybrid.day.raster, overlay: defaultLayers.hybrid.day.vector }
 );
 
-const NAV_ZOOM = 16;
+// Close "driving" zoom (not an overview level) with a moderate forward tilt
+// for the classic chase-camera turn-by-turn look; flat/north-up otherwise.
+const NAV_ZOOM = 18;
+const NAV_TILT = 45;
 const OFF_ROUTE_METERS = 100;
-const FORWARD_BIAS_RATIO = 0.68;
 
 // Distance thresholds for the two-stage proximity alert system (stations,
 // highway exits, and turn maneuvers all share the same pipeline).
@@ -57,11 +59,11 @@ const ALERT_BANNER_METERS = 500;
 const ALERT_PASSED_METERS = 100;
 const ALERT_TOAST_DURATION_MS = 15000;
 
-const ALERT_STYLES = {
-  station: { background: '#dc2626', color: 'white', defaultName: 'MTO Inspection Station' },
-  exit: { background: '#f59e0b', color: '#111827', defaultName: 'Highway Exit' },
-  turn: { background: '#2563eb', color: 'white', defaultName: 'Turn' }
-};
+// The only alert-worthy proximity event that isn't already continuously
+// visible in the top instruction banner — turn/exit maneuvers are covered by
+// that banner's live NEXT/THEN text, so surfacing them here too would just
+// repeat the same instruction in a second banner underneath it.
+const STATION_ALERT_STYLE = { background: '#dc2626', color: 'white', defaultName: 'MTO Inspection Station' };
 
 const toRad = (deg) => (deg * Math.PI) / 180;
 const toDeg = (rad) => (rad * 180) / Math.PI;
@@ -242,23 +244,24 @@ const describeAction = (action) => {
   return road ? `Continue on ${road}` : 'Continue';
 };
 
-// Only 'exit' (highway off-ramp) and turn/uTurn maneuvers are alert-worthy;
-// depart/arrive/continue/ramp/roundabout actions are excluded to avoid noise.
-const ACTION_ALERT_KIND = { exit: 'exit', turn: 'turn', uTurn: 'turn' };
-
 const buildNavActions = (section, cumulative) => (section.actions || []).map((action) => ({
   text: describeAction(action),
-  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1],
-  alertKind: ACTION_ALERT_KIND[action.action] || null
+  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1]
 }));
 
+// Top-down truck silhouette (cab + cargo box) instead of a plain arrow, so
+// the marker itself reads as "truck" — rotates with heading, cab pointing
+// in the direction of travel, matching the chase camera's rotation.
 const createDriverIcon = (headingDeg) => new H.map.Icon(
-  '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">' +
-    `<g transform="rotate(${headingDeg} 16 16)">` +
-      '<path d="M16 3 L26 27 L16 21 L6 27 Z" fill="#2563eb" stroke="white" stroke-width="2" stroke-linejoin="round"/>' +
+  '<svg xmlns="http://www.w3.org/2000/svg" width="34" height="44" viewBox="0 0 34 44">' +
+    `<g transform="rotate(${headingDeg} 17 22)">` +
+      '<rect x="6" y="12" width="22" height="28" rx="3" fill="#2563eb" stroke="white" stroke-width="2"/>' +
+      '<rect x="11" y="3" width="12" height="10" rx="2" fill="#2563eb" stroke="white" stroke-width="2"/>' +
+      '<line x1="10" y1="20" x2="24" y2="20" stroke="white" stroke-width="1.2" opacity="0.55"/>' +
+      '<line x1="10" y1="28" x2="24" y2="28" stroke="white" stroke-width="1.2" opacity="0.55"/>' +
     '</g>' +
   '</svg>',
-  { size: { w: 32, h: 32 }, anchor: { x: 16, y: 16 } }
+  { size: { w: 34, h: 44 }, anchor: { x: 17, y: 22 } }
 );
 
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
@@ -511,6 +514,48 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
   useEffect(() => {
     fetchSavedRoutes();
+  }, []);
+
+  // Pre-fills the route search card's start field with the driver's current
+  // GPS position on mount, reverse-geocoded to a readable address (falling
+  // back to raw coordinates if that fails). Uses a functional setState check
+  // rather than the startLocation closure so it never clobbers text the user
+  // typed while the (often multi-second) GPS fix/reverse-geocode was pending.
+  // A denied/unavailable permission is silently ignored — the field just
+  // stays empty for manual entry, same as before this existed.
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    let cancelled = false;
+
+    const applyStart = (text, position) => {
+      if (cancelled) return;
+      setStartLocation((current) => {
+        if (current) return current;
+        startResolvedRef.current = { text, position };
+        return text;
+      });
+    };
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (cancelled) return;
+        const { latitude, longitude } = position.coords;
+        const geoPosition = { lat: latitude, lng: longitude };
+        const fallbackText = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+        if (!platformRef.current) {
+          applyStart(fallbackText, geoPosition);
+          return;
+        }
+        platformRef.current.getSearchService().reverseGeocode({ at: `${latitude},${longitude}` }, (result) => {
+          const label = result.items?.[0]?.address?.label;
+          applyStart(label ? label.replace(/,\s*Canada$/i, '') : fallbackText, geoPosition);
+        }, () => applyStart(fallbackText, geoPosition));
+      },
+      () => {}, // permission denied or unavailable — leave the field empty
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
+    );
+
+    return () => { cancelled = true; };
   }, []);
 
   // Re-checks the driver's country every few minutes while navigating so
@@ -1013,15 +1058,18 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     }
   };
 
-  // Shifts the map center so the driver renders below screen-center (more of
-  // the road ahead is visible) rather than dead-center, independent of heading.
-  const followDriver = (lat, lng) => {
-    const height = mapRef.current.clientHeight;
-    const desiredY = height * FORWARD_BIAS_RATIO;
-    const driverScreen = mapInstance.current.geoToScreen({ lat, lng });
-    const targetScreen = { x: driverScreen.x, y: height / 2 + driverScreen.y - desiredY };
-    const targetGeo = mapInstance.current.screenToGeo(targetScreen.x, targetScreen.y);
-    mapInstance.current.setCenter({ lat: targetGeo.lat, lng: targetGeo.lng });
+  // Chase-camera: rotates the map to the driver's heading and tilts it to a
+  // driving-height perspective, centered on the current GPS fix. Screen-space
+  // forward-biasing (recentering below screen-center) doesn't compose with a
+  // rotated/tilted camera the way it did for the old flat north-up view, so
+  // this replaces that with HERE's own look-at heading/tilt instead.
+  const updateNavCamera = (lat, lng, headingDeg) => {
+    mapInstance.current.getViewModel().setLookAtData({
+      position: { lat, lng },
+      zoom: NAV_ZOOM,
+      heading: headingDeg,
+      tilt: NAV_TILT
+    });
   };
 
   const applyNavRoute = (section) => {
@@ -1117,13 +1165,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     if (!driverMarkerRef.current) {
       driverMarkerRef.current = new H.map.Marker(currentPos, { icon: createDriverIcon(effectiveHeading) });
       mapInstance.current.addObject(driverMarkerRef.current);
-      mapInstance.current.setZoom(NAV_ZOOM);
     } else {
       driverMarkerRef.current.setGeometry(currentPos);
       driverMarkerRef.current.setIcon(createDriverIcon(effectiveHeading));
     }
 
-    followDriver(latitude, longitude);
+    updateNavCamera(latitude, longitude, effectiveHeading);
 
     const points = navRoutePointsRef.current;
     const cumulative = navCumulativeRef.current;
@@ -1168,50 +1215,33 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       tollCurrency: navTollRef.current?.currency ?? null
     });
 
-    updateProximityAlerts(currentPos, points, index, travelled);
+    updateProximityAlerts(currentPos, points, index);
   };
 
-  // Builds the combined list of upcoming alert-worthy points (MTO stations,
-  // highway exits, turn maneuvers), then drives the two-stage toast/banner
-  // alert pipeline: a 2km toast that fires once per point, and a persistent
-  // 500m banner with a live countdown that clears 100m past the point.
-  const updateProximityAlerts = (currentPos, points, index, travelled) => {
-    const candidates = [];
-
-    (currentInspectionStationsRef.current || []).forEach((station) => {
-      if (station.latitude == null || station.longitude == null) return;
-      const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
-      if (stationIndex < index - 3) return;
-      candidates.push({
+  // Builds the list of upcoming MTO inspection stations, then drives the
+  // two-stage toast/banner alert pipeline: a 2km toast that fires once per
+  // station, and a persistent 500m banner with a live countdown that clears
+  // 100m past the station. Turn/exit maneuvers aren't alerted here — they're
+  // already continuously visible in the top instruction banner's NEXT/THEN
+  // text, so a second banner for them would just repeat the same turn.
+  const updateProximityAlerts = (currentPos, points, index) => {
+    const candidates = (currentInspectionStationsRef.current || [])
+      .filter((station) => station.latitude != null && station.longitude != null)
+      .filter((station) => {
+        const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+        return stationIndex >= index - 3;
+      })
+      .map((station) => ({
         id: `station-${station.id ?? `${station.latitude},${station.longitude}`}`,
-        kind: 'station',
-        name: station.name || ALERT_STYLES.station.defaultName,
+        name: station.name || STATION_ALERT_STYLE.defaultName,
         distanceMeters: haversineMeters(currentPos, { lat: station.latitude, lng: station.longitude })
-      });
-    });
-
-    navActionsRef.current.forEach((action, i) => {
-      if (!action.alertKind) return;
-      const distanceMeters = action.distanceMeters - travelled;
-      if (distanceMeters < -ALERT_TOAST_METERS) return;
-      candidates.push({
-        id: `action-${i}`,
-        kind: action.alertKind,
-        name: action.text,
-        distanceMeters
-      });
-    });
+      }));
 
     const bannerCandidate = candidates
       .filter((p) => p.distanceMeters <= ALERT_BANNER_METERS && p.distanceMeters > -ALERT_PASSED_METERS)
       .sort((a, b) => a.distanceMeters - b.distanceMeters)[0] || null;
 
-    setBannerAlert(bannerCandidate ? {
-      id: bannerCandidate.id,
-      kind: bannerCandidate.kind,
-      name: bannerCandidate.name,
-      distanceMeters: bannerCandidate.distanceMeters
-    } : null);
+    setBannerAlert(bannerCandidate);
 
     const toastCandidate = candidates
       .filter((p) => p.distanceMeters <= ALERT_TOAST_METERS && p.distanceMeters > ALERT_BANNER_METERS)
@@ -1222,7 +1252,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       if (!state?.toastShown) {
         alertStateRef.current.set(toastCandidate.id, { toastShown: true });
         clearTimeout(toastTimeoutRef.current);
-        setToastAlert({ id: toastCandidate.id, kind: toastCandidate.kind, name: toastCandidate.name });
+        setToastAlert(toastCandidate);
         toastTimeoutRef.current = setTimeout(() => {
           setToastAlert((current) => (current?.id === toastCandidate.id ? null : current));
         }, ALERT_TOAST_DURATION_MS);
@@ -1287,6 +1317,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     clearTimeout(toastTimeoutRef.current);
     alertStateRef.current = new Map();
 
+    // Back to a flat, north-up overview — the chase-camera heading/tilt only
+    // apply during active turn-by-turn navigation.
+    mapInstance.current.getViewModel().setLookAtData({ heading: 0, tilt: 0 });
+
     setNavigating(false);
     onNavigatingChange?.(false);
     setRecalculating(false);
@@ -1323,10 +1357,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       <style>{`
         @media (max-width: 480px) {
           .mt-route-card {
+            /* Corner-anchored + capped width (same technique as the
+               hamburger drawer) rather than stretched with left+right insets,
+               so it stays a compact floating card instead of spanning the
+               screen on wider phones. */
             left: 12px !important;
-            right: 12px !important;
             top: 84px !important;
-            width: auto !important;
+            width: min(340px, calc(100vw - 24px)) !important;
             max-height: calc(100vh - 100px) !important;
             overflow-y: auto !important;
           }
@@ -1357,6 +1394,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       `}</style>
       {navigating && (
         <>
+          {/* Instruction banner, recalculating pill, and station alert all
+              stack in normal document flow (not independent absolutely-
+              positioned guesses at each other's height) so a long wrapped
+              instruction can never get covered by the elements below it. */}
           <div
             style={{
               position: 'absolute',
@@ -1364,131 +1405,243 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               left: 0,
               right: 0,
               zIndex: 2500,
-              ...PANEL_STYLE,
-              borderTop: 'none',
-              borderLeft: 'none',
-              borderRight: 'none',
-              borderBottom: '1px solid var(--color-border)',
-              padding: '14px 20px 16px'
+              display: 'flex',
+              flexDirection: 'column'
             }}
           >
-            {currentInstruction ? (
-              <>
-                <div style={{ ...LABEL_STYLE, display: 'flex', alignItems: 'baseline', gap: '6px' }}>
-                  <span style={{ color: 'var(--color-route-normal)' }}>NEXT</span>
-                  <span>·</span>
-                  <span style={{ ...MONO_STYLE, fontSize: '12px', fontWeight: 700, textTransform: 'none', letterSpacing: 'normal', color: 'var(--color-text-primary)' }}>
-                    {formatDistance(currentInstruction.distanceMeters)}
-                  </span>
-                </div>
-                <div style={{ fontFamily: 'var(--font-display)', fontSize: '21px', fontWeight: 600, letterSpacing: '-0.01em', marginTop: '4px' }}>
-                  {currentInstruction.text}
-                </div>
-                {nextInstruction && (
-                  <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginTop: '8px' }}>
-                    <span style={LABEL_STYLE}>THEN</span>
-                    <span style={{ fontFamily: 'var(--font-display)', fontSize: '13px', color: 'var(--color-text-muted)' }}>{nextInstruction.text}</span>
-                  </div>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '12px',
+                ...PANEL_STYLE,
+                borderTop: 'none',
+                borderLeft: 'none',
+                borderRight: 'none',
+                borderBottom: '1px solid var(--color-border)',
+                padding: 'calc(14px + env(safe-area-inset-top)) 16px 16px 20px'
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {currentInstruction ? (
+                  <>
+                    <div style={{ ...LABEL_STYLE, display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+                      <span style={{ color: 'var(--color-route-normal)' }}>NEXT</span>
+                      <span>·</span>
+                      <span style={{ ...MONO_STYLE, fontSize: '12px', fontWeight: 700, textTransform: 'none', letterSpacing: 'normal', color: 'var(--color-text-primary)' }}>
+                        {formatDistance(currentInstruction.distanceMeters)}
+                      </span>
+                    </div>
+                    <div style={{ fontFamily: 'var(--font-display)', fontSize: '21px', fontWeight: 600, letterSpacing: '-0.01em', marginTop: '4px', overflowWrap: 'break-word' }}>
+                      {currentInstruction.text}
+                    </div>
+                    {nextInstruction && (
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginTop: '8px', flexWrap: 'wrap' }}>
+                        <span style={LABEL_STYLE}>THEN</span>
+                        <span style={{ fontFamily: 'var(--font-display)', fontSize: '13px', color: 'var(--color-text-muted)' }}>{nextInstruction.text}</span>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div style={{ fontFamily: 'var(--font-display)', fontSize: '16px' }}>Follow the highlighted route</div>
                 )}
-              </>
-            ) : (
-              <div style={{ fontFamily: 'var(--font-display)', fontSize: '16px' }}>Follow the highlighted route</div>
-            )}
-          </div>
+              </div>
 
-          {recalculating && (
-            <div
-              style={{
-                position: 'absolute',
-                top: '124px',
-                left: '50%',
-                transform: 'translateX(-50%)',
-                zIndex: 2500,
-                background: '#fbbf24',
-                color: '#78350f',
-                padding: '8px 16px',
-                borderRadius: 'var(--radius-soft)',
-                fontFamily: 'var(--font-display)',
-                textTransform: 'uppercase',
-                letterSpacing: '0.05em',
-                fontSize: '13px',
-                fontWeight: 700
-              }}
-            >
-              Recalculating…
-            </div>
-          )}
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px', flexShrink: 0 }}>
+                <div ref={optionsMenuRef} style={{ position: 'relative' }}>
+                  <button
+                    onClick={() => setOptionsMenuOpen((open) => !open)}
+                    aria-label="Options menu"
+                    style={{
+                      width: '44px',
+                      height: '44px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      borderRadius: 0,
+                      border: '1px solid var(--color-border)',
+                      background: 'var(--color-panel)',
+                      color: 'var(--color-text-primary)',
+                      fontSize: '18px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
+                    }}
+                  >
+                    ⋮
+                  </button>
 
-          {bannerAlert ? (
-            <div
-              style={{
-                position: 'absolute',
-                top: '124px',
-                left: '16px',
-                zIndex: 2600,
-                maxWidth: '280px',
-                background: ALERT_STYLES[bannerAlert.kind].background,
-                color: ALERT_STYLES[bannerAlert.kind].color,
-                padding: '12px 16px',
-                borderRadius: 'var(--radius-soft)',
-                fontFamily: 'var(--font-display)',
-                fontWeight: 700,
-                boxShadow: '0 4px 14px rgba(0,0,0,0.4)'
-              }}
-            >
-              ⚠️ {bannerAlert.name} — <span style={MONO_STYLE}>{Math.max(0, Math.round(bannerAlert.distanceMeters))}m</span> ahead
-            </div>
-          ) : toastAlert && (
-            <div
-              style={{
-                position: 'absolute',
-                top: '124px',
-                left: '16px',
-                zIndex: 2600,
-                maxWidth: '280px',
-                background: 'var(--color-panel)',
-                color: 'var(--color-text-primary)',
-                padding: '12px 44px 12px 14px',
-                borderRadius: 'var(--radius-soft)',
-                border: '1px solid var(--color-border)',
-                borderLeft: `4px solid ${ALERT_STYLES[toastAlert.kind].background}`,
-                boxShadow: '0 4px 14px rgba(0,0,0,0.3)'
-              }}
-            >
-              <button
-                onClick={dismissToastAlert}
-                aria-label="Dismiss alert"
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  right: 0,
-                  width: '44px',
-                  height: '44px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  border: 'none',
-                  background: 'transparent',
-                  color: 'var(--color-text-muted)',
-                  fontSize: '14px',
-                  fontWeight: 'bold',
-                  cursor: 'pointer',
-                  lineHeight: 1
-                }}
-              >
-                ✕
-              </button>
-              <div style={{ fontFamily: 'var(--font-display)', fontSize: '14px', fontWeight: 700 }}>
-                Incoming: {toastAlert.name}
+                  {optionsMenuOpen && (
+                    <div
+                      style={{
+                        position: 'absolute',
+                        top: '48px',
+                        right: 0,
+                        width: '210px',
+                        background: 'var(--color-panel)',
+                        border: '1px solid var(--color-border)',
+                        borderRadius: 0,
+                        boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
+                        overflow: 'hidden'
+                      }}
+                    >
+                      <button
+                        onClick={() => { setShowProfileModal(true); setOptionsMenuOpen(false); }}
+                        style={MENU_ITEM_STYLE}
+                      >
+                        View Profile
+                      </button>
+                      <button
+                        onClick={() => { setShowMtoContactModal(true); setOptionsMenuOpen(false); }}
+                        style={MENU_ITEM_STYLE}
+                      >
+                        MTO Contact Info
+                      </button>
+                      <button
+                        onClick={() => setSpeedUnitMenuOpen((open) => !open)}
+                        style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid var(--color-border)' : 'none' }}
+                      >
+                        Speed Units {speedUnitMenuOpen ? '▲' : '▼'}
+                      </button>
+                      {speedUnitMenuOpen && SPEED_UNIT_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => handleSelectSpeedUnit(opt.value)}
+                          style={{
+                            ...MENU_ITEM_STYLE,
+                            paddingLeft: '26px',
+                            fontSize: '12px',
+                            background: speedUnit === opt.value ? 'color-mix(in srgb, var(--color-route-normal) 15%, var(--color-panel))' : 'var(--color-panel)',
+                            fontWeight: speedUnit === opt.value ? 700 : 400
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    ...PANEL_STYLE,
+                    borderLeft: '3px solid var(--color-route-normal)',
+                    padding: '8px 14px',
+                    textAlign: 'center',
+                    minWidth: '96px',
+                    boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
+                  }}
+                >
+                  <div style={{ ...MONO_STYLE, fontSize: '26px', fontWeight: 700, lineHeight: 1.1, color: currentSpeedMps != null ? 'var(--color-text-primary)' : 'var(--color-text-muted)' }}>
+                    {formatSpeedValue(currentSpeedMps, effectiveSpeedUnit)}
+                  </div>
+                  <div style={{ ...LABEL_STYLE, marginBottom: '6px' }}>
+                    {unitLabel(effectiveSpeedUnit)}
+                  </div>
+                  <div style={{ ...LABEL_STYLE, borderTop: '1px solid var(--color-grid-line)', paddingTop: '6px' }}>
+                    LIMIT{' '}
+                    {currentSpeedLimitMps != null ? (
+                      <span style={{ ...MONO_STYLE, textTransform: 'none', color: 'var(--color-text-primary)', fontWeight: 600 }}>
+                        {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--color-text-muted)' }}>unknown</span>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
-          )}
+
+            {recalculating && (
+              <div
+                style={{
+                  alignSelf: 'center',
+                  marginTop: '8px',
+                  background: '#fbbf24',
+                  color: '#78350f',
+                  padding: '8px 16px',
+                  borderRadius: 'var(--radius-soft)',
+                  fontFamily: 'var(--font-display)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  fontSize: '13px',
+                  fontWeight: 700
+                }}
+              >
+                Recalculating…
+              </div>
+            )}
+
+            {bannerAlert ? (
+              <div
+                style={{
+                  alignSelf: 'flex-start',
+                  marginTop: '8px',
+                  marginLeft: '16px',
+                  maxWidth: '280px',
+                  background: STATION_ALERT_STYLE.background,
+                  color: STATION_ALERT_STYLE.color,
+                  padding: '12px 16px',
+                  borderRadius: 'var(--radius-soft)',
+                  fontFamily: 'var(--font-display)',
+                  fontWeight: 700,
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.4)'
+                }}
+              >
+                ⚠️ {bannerAlert.name} — <span style={MONO_STYLE}>{Math.max(0, Math.round(bannerAlert.distanceMeters))}m</span> ahead
+              </div>
+            ) : toastAlert && (
+              <div
+                style={{
+                  alignSelf: 'flex-start',
+                  marginTop: '8px',
+                  marginLeft: '16px',
+                  maxWidth: '280px',
+                  background: 'var(--color-panel)',
+                  color: 'var(--color-text-primary)',
+                  padding: '12px 44px 12px 14px',
+                  borderRadius: 'var(--radius-soft)',
+                  border: '1px solid var(--color-border)',
+                  borderLeft: `4px solid ${STATION_ALERT_STYLE.background}`,
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
+                  position: 'relative'
+                }}
+              >
+                <button
+                  onClick={dismissToastAlert}
+                  aria-label="Dismiss alert"
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    right: 0,
+                    width: '44px',
+                    height: '44px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--color-text-muted)',
+                    fontSize: '14px',
+                    fontWeight: 'bold',
+                    cursor: 'pointer',
+                    lineHeight: 1
+                  }}
+                >
+                  ✕
+                </button>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '14px', fontWeight: 700 }}>
+                  Incoming: {toastAlert.name}
+                </div>
+              </div>
+            )}
+          </div>
 
           <button
             onClick={stopNavigation}
             style={{
               position: 'absolute',
-              bottom: '96px',
+              bottom: 'calc(96px + env(safe-area-inset-bottom))',
               left: '50%',
               transform: 'translateX(-50%)',
               zIndex: 2500,
@@ -1514,108 +1667,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             Stop Navigation
           </button>
 
-          <div ref={optionsMenuRef} style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 2700 }}>
-            <button
-              onClick={() => setOptionsMenuOpen((open) => !open)}
-              aria-label="Options menu"
-              style={{
-                width: '44px',
-                height: '44px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                borderRadius: 0,
-                border: '1px solid var(--color-border)',
-                background: 'var(--color-panel)',
-                color: 'var(--color-text-primary)',
-                fontSize: '18px',
-                fontWeight: 700,
-                cursor: 'pointer',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
-              }}
-            >
-              ⋮
-            </button>
-
-            {optionsMenuOpen && (
-              <div
-                style={{
-                  position: 'absolute',
-                  top: '48px',
-                  right: 0,
-                  width: '210px',
-                  background: 'var(--color-panel)',
-                  border: '1px solid var(--color-border)',
-                  borderRadius: 0,
-                  boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
-                  overflow: 'hidden'
-                }}
-              >
-                <button
-                  onClick={() => { setShowProfileModal(true); setOptionsMenuOpen(false); }}
-                  style={MENU_ITEM_STYLE}
-                >
-                  View Profile
-                </button>
-                <button
-                  onClick={() => { setShowMtoContactModal(true); setOptionsMenuOpen(false); }}
-                  style={MENU_ITEM_STYLE}
-                >
-                  MTO Contact Info
-                </button>
-                <button
-                  onClick={() => setSpeedUnitMenuOpen((open) => !open)}
-                  style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid var(--color-border)' : 'none' }}
-                >
-                  Speed Units {speedUnitMenuOpen ? '▲' : '▼'}
-                </button>
-                {speedUnitMenuOpen && SPEED_UNIT_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.value}
-                    onClick={() => handleSelectSpeedUnit(opt.value)}
-                    style={{
-                      ...MENU_ITEM_STYLE,
-                      paddingLeft: '26px',
-                      fontSize: '12px',
-                      background: speedUnit === opt.value ? 'color-mix(in srgb, var(--color-route-normal) 15%, var(--color-panel))' : 'var(--color-panel)',
-                      fontWeight: speedUnit === opt.value ? 700 : 400
-                    }}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div
-            style={{
-              position: 'absolute',
-              top: '68px',
-              right: '16px',
-              zIndex: 2600,
-              ...PANEL_STYLE,
-              borderLeft: '3px solid var(--color-route-normal)',
-              padding: '10px 16px',
-              textAlign: 'center',
-              minWidth: '110px',
-              boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
-            }}
-          >
-            <div style={{ ...MONO_STYLE, fontSize: '26px', fontWeight: 700, lineHeight: 1.1 }}>
-              {formatSpeedValue(currentSpeedMps, effectiveSpeedUnit)}
-            </div>
-            <div style={{ ...LABEL_STYLE, marginBottom: '6px' }}>
-              {unitLabel(effectiveSpeedUnit)}
-            </div>
-            <div style={LABEL_STYLE}>
-              LIMIT{' '}
-              <span style={{ ...MONO_STYLE, textTransform: 'none', color: 'var(--color-text-primary)', fontWeight: 600 }}>
-                {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
-              </span>
-            </div>
-          </div>
-
           {tripStats && (
             <div
               className="mt-trip-stats"
@@ -1623,7 +1674,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 position: 'absolute',
                 left: '16px',
                 right: '16px',
-                bottom: '16px',
+                bottom: 'calc(16px + env(safe-area-inset-bottom))',
                 zIndex: 2500,
                 display: 'flex',
                 ...PANEL_STYLE,
