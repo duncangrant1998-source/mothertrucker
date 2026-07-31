@@ -9,10 +9,6 @@ import ColorSchemeToggle from './components/ColorSchemeToggle';
 import Auth from './Auth';
 import ResetPassword from './ResetPassword';
 
-const getSystemPrefersDark = () => (
-  typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches
-);
-
 function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -25,13 +21,12 @@ function App() {
   const [gridOverlay, setGridOverlay] = useState(() => (
     localStorage.getItem('gridOverlay') === 'on' ? 'on' : 'off'
   ));
-  // null = no manual override yet, keep following the system/OS scheme
-  // (including its own automatic day/night switch) exactly as before.
+  // null = no manual override yet, defaults to dark (see effectiveColorScheme)
+  // rather than following the system/OS scheme.
   const [manualColorScheme, setManualColorScheme] = useState(() => {
     const stored = localStorage.getItem('colorScheme');
     return stored === 'light' || stored === 'dark' ? stored : null;
   });
-  const [systemPrefersDark, setSystemPrefersDark] = useState(getSystemPrefersDark);
 
   const handleMapLayerChange = (value) => {
     setMapLayer(value);
@@ -48,26 +43,18 @@ function App() {
     localStorage.setItem('colorScheme', value);
   };
 
-  // Tracks the OS preference live so the toggle's active segment stays
-  // accurate even while no manual override has been made.
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const handleChange = (e) => setSystemPrefersDark(e.matches);
-    mq.addEventListener('change', handleChange);
-    return () => mq.removeEventListener('change', handleChange);
-  }, []);
+  // The signed-out screen (Auth) always renders in dark mode, regardless of
+  // system preference or a saved manual override — there's no logged-in user
+  // yet to have a preference for.
+  const showingAuthScreen = !loading && !passwordRecovery && !user;
 
-  // No manual override -> no data-theme attribute -> the existing
-  // prefers-color-scheme CSS keeps driving the theme untouched.
+  // Dark is the default for both the signed-out screen and the main app
+  // until the user explicitly picks Light from the drawer's toggle.
   useEffect(() => {
-    if (manualColorScheme) {
-      document.documentElement.setAttribute('data-theme', manualColorScheme);
-    } else {
-      document.documentElement.removeAttribute('data-theme');
-    }
-  }, [manualColorScheme]);
+    document.documentElement.setAttribute('data-theme', showingAuthScreen ? 'dark' : (manualColorScheme ?? 'dark'));
+  }, [manualColorScheme, showingAuthScreen]);
 
-  const effectiveColorScheme = manualColorScheme ?? (systemPrefersDark ? 'dark' : 'light');
+  const effectiveColorScheme = manualColorScheme ?? 'dark';
 
   // Keeps the browser/OS chrome (status bar tint, task switcher card) matching
   // the app's actual displayed scheme — including a manual drawer override,
@@ -75,8 +62,9 @@ function App() {
   // its own since it has no way to know about anything but the OS preference.
   useEffect(() => {
     const meta = document.getElementById('theme-color-meta');
-    if (meta) meta.setAttribute('content', effectiveColorScheme === 'dark' ? '#1F2327' : '#e85d04');
-  }, [effectiveColorScheme]);
+    const scheme = showingAuthScreen ? 'dark' : effectiveColorScheme;
+    if (meta) meta.setAttribute('content', scheme === 'dark' ? '#1F2327' : '#e85d04');
+  }, [effectiveColorScheme, showingAuthScreen]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {

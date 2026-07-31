@@ -42,7 +42,7 @@ const ResetPassword = ({ onDone }) => {
       width: '320px',
       zIndex: 2000
     }}>
-      <h2 style={{ marginBottom: '8px', textAlign: 'center' }}>Set New Password</h2>
+      <h2 style={{ marginBottom: '8px', textAlign: 'center', color: '#1B1F23' }}>Set New Password</h2>
       <p style={{ marginBottom: '16px', fontSize: '12px', color: '#666', textAlign: 'center' }}>
         Choose a new password for your account.
       </p>
@@ -59,7 +59,9 @@ const ResetPassword = ({ onDone }) => {
           border: '1px solid #ccc',
           borderRadius: '4px',
           fontSize: '14px',
-          boxSizing: 'border-box'
+          boxSizing: 'border-box',
+          color: '#1B1F23',
+          background: '#FFFFFF'
         }}
       />
 
@@ -75,7 +77,9 @@ const ResetPassword = ({ onDone }) => {
           border: '1px solid #ccc',
           borderRadius: '4px',
           fontSize: '14px',
-          boxSizing: 'border-box'
+          boxSizing: 'border-box',
+          color: '#1B1F23',
+          background: '#FFFFFF'
         }}
       />
 

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { supabase } from './lib/supabase';
+import highwayDusk from './assets/highway-dusk.svg';
 
 const Auth = ({ onAuthChange }) => {
   const [email, setEmail] = useState('');
@@ -66,6 +67,21 @@ const Auth = ({ onAuthChange }) => {
     <>
     <div style={{
       position: 'absolute',
+      inset: 0,
+      zIndex: 0,
+      backgroundImage: `url("${highwayDusk}")`,
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat'
+    }} />
+    <div style={{
+      position: 'absolute',
+      inset: 0,
+      zIndex: 1,
+      background: 'rgba(0,0,0,0.5)'
+    }} />
+    <div style={{
+      position: 'absolute',
       top: '50%',
       left: '50%',
       transform: 'translate(-50%, -50%)',
@@ -76,8 +92,8 @@ const Auth = ({ onAuthChange }) => {
       width: '320px',
       zIndex: 2000
     }}>
-      <h2 style={{ marginBottom: '20px', textAlign: 'center' }}>Mother Trucker</h2>
-      
+      <h2 style={{ marginBottom: '20px', textAlign: 'center', color: '#1B1F23' }}>Mother Trucker</h2>
+
       <input
         id="login-email"
         type="email"
@@ -91,10 +107,12 @@ const Auth = ({ onAuthChange }) => {
           border: '1px solid #ccc',
           borderRadius: '4px',
           fontSize: '14px',
-          boxSizing: 'border-box'
+          boxSizing: 'border-box',
+          color: '#1B1F23',
+          background: '#FFFFFF'
         }}
       />
-      
+
       <input
         type="password"
         placeholder="Password"
@@ -107,7 +125,9 @@ const Auth = ({ onAuthChange }) => {
           border: '1px solid #ccc',
           borderRadius: '4px',
           fontSize: '14px',
-          boxSizing: 'border-box'
+          boxSizing: 'border-box',
+          color: '#1B1F23',
+          background: '#FFFFFF'
         }}
       />
 
@@ -200,7 +220,7 @@ const Auth = ({ onAuthChange }) => {
             width: '300px'
           }}
         >
-          <h3 style={{ marginBottom: '8px', fontSize: '16px' }}>Reset Password</h3>
+          <h3 style={{ marginBottom: '8px', fontSize: '16px', color: '#1B1F23' }}>Reset Password</h3>
           <p style={{ marginBottom: '14px', fontSize: '12px', color: '#666' }}>
             Enter your email and we'll send you a link to reset your password.
           </p>
@@ -218,7 +238,9 @@ const Auth = ({ onAuthChange }) => {
               border: '1px solid #ccc',
               borderRadius: '4px',
               fontSize: '14px',
-              boxSizing: 'border-box'
+              boxSizing: 'border-box',
+              color: '#1B1F23',
+              background: '#FFFFFF'
             }}
           />
           {resetError && (
