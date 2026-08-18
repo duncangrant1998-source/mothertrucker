@@ -50,7 +50,41 @@ const getSatelliteLayers = (defaultLayers, colorScheme) => (
 // for the classic chase-camera turn-by-turn look; flat/north-up otherwise.
 const NAV_ZOOM = 18;
 const NAV_TILT = 45;
+// Distance at which route-derived heading is no longer trusted (falls back
+// to GPS-fix-to-fix bearing) — deliberately looser than REROUTE_TRIGGER_METERS
+// below, since "is this still a decent proxy for my heading" is a lower bar
+// than "request a whole new route."
 const OFF_ROUTE_METERS = 100;
+
+// Automatic-reroute trigger: a single fix past this distance from the route
+// polyline only starts counting toward confirmation — it takes
+// REROUTE_CONFIRM_FIXES consecutive qualifying fixes (hysteresis) before a
+// reroute actually fires, so one noisy fix or a wide lane doesn't trigger it.
+const REROUTE_TRIGGER_METERS = 50;
+const REROUTE_CONFIRM_FIXES = 3;
+// Minimum gap between reroute *attempts* (successful or failed) — guards
+// against firing a new request on every ~1s GPS fix while off-route, and
+// throttles retries after a failure instead of hammering the API.
+const REROUTE_COOLDOWN_MS = 5000;
+const REROUTE_SUCCESS_NOTICE_MS = 4000;
+
+// Below this speed, GPS-derived bearing is essentially noise (two nearly-
+// identical fixes with GPS jitter can point anywhere), so heading target
+// updates are frozen rather than fed to the marker/camera.
+const MIN_HEADING_SPEED_MPS = 5 / 3.6;
+
+// How far ahead along the route polyline (in meters) to look when deriving
+// heading from route geometry — far enough that two closely-spaced polyline
+// vertices don't produce a noisy near-zero-length bearing.
+const ROUTE_HEADING_LOOKAHEAD_METERS = 15;
+
+// GPS fixes arrive in bursts roughly once a second; the marker/camera are
+// animated from their last rendered pose to each new fix over this long,
+// clamped so a delayed or back-to-back-fast fix can't produce a stalled or
+// instant-snap animation.
+const NAV_ANIM_MIN_MS = 300;
+const NAV_ANIM_MAX_MS = 2000;
+const NAV_ANIM_DEFAULT_MS = 1000;
 
 // Distance thresholds for the two-stage proximity alert system (stations,
 // highway exits, and turn maneuvers all share the same pipeline).
@@ -83,6 +117,43 @@ const bearingDegrees = (from, to) => {
   const x = Math.cos(toRad(from.lat)) * Math.sin(toRad(to.lat)) -
     Math.sin(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.cos(toRad(to.lng - from.lng));
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
+};
+
+const normalizeDegrees = (deg) => ((deg % 360) + 360) % 360;
+
+// Signed shortest angular step from `from` to `to`, in (-180, 180] — used to
+// interpolate headings across the 359°→1° wraparound without spinning the
+// long way round.
+const shortestAngleDelta = (from, to) => ((to - from + 540) % 360) - 180;
+
+// Walks the cumulative-distance table to find a point a fixed distance ahead
+// of `index` along the route polyline, so route-derived heading is measured
+// over a short but non-trivial stretch of road rather than between two
+// nearly-identical adjacent vertices (which would be noisy).
+const lookaheadRoutePoint = (points, cumulative, index, metersAhead) => {
+  const targetDist = cumulative[index] + metersAhead;
+  for (let i = index; i < points.length; i++) {
+    if (cumulative[i] >= targetDist) return points[i];
+  }
+  return points[points.length - 1];
+};
+
+// Heading is derived from the route geometry ahead of the driver whenever
+// they're on-route: this is what production nav apps do, and unlike
+// GeolocationPosition.coords.heading (often null, or wildly noisy at low
+// speed) it can't jitter — it only changes once the matched route index
+// moves onto a genuinely different-angled segment. A GPS-fix-to-GPS-fix
+// bearing is the fallback for when there's no matched route to anchor to
+// (off-route / recalculating).
+const deriveTargetHeading = (onRoute, points, cumulative, index, prevPos, currentPos) => {
+  if (onRoute && points && points.length > 1) {
+    const origin = points[index];
+    const ahead = lookaheadRoutePoint(points, cumulative, index, ROUTE_HEADING_LOOKAHEAD_METERS);
+    if (ahead.lat !== origin.lat || ahead.lng !== origin.lng) {
+      return bearingDegrees(origin, ahead);
+    }
+  }
+  return prevPos ? bearingDegrees(prevPos, currentPos) : null;
 };
 
 const decodeRoutePoints = (polyline) => {
@@ -147,6 +218,54 @@ const unitLabel = (unit) => (unit === 'mph' ? 'mph' : 'km/h');
 const formatSpeedValue = (mps, unit) => {
   if (mps == null) return '—';
   return Math.round(mps * (unit === 'mph' ? MPS_TO_MPH : MPS_TO_KPH));
+};
+
+// Autosuggest dropdown: fetch enough results for a meaningful "See more"
+// expansion, but only show the top 3 by default so the collapsed list is
+// short enough to fit above an on-screen keyboard.
+const SUGGESTION_FETCH_LIMIT = 8;
+const SUGGESTION_VISIBLE_COUNT = 3;
+// Breathing room kept between the bottom of the dropdown and the edge of
+// the visible viewport (or the top of the on-screen keyboard).
+const DROPDOWN_BOTTOM_MARGIN = 8;
+// Used only on browsers without window.visualViewport — dvh (dynamic
+// viewport height) is the closest CSS-only proxy for "actually visible
+// area," though unlike VisualViewport it doesn't reliably subtract the
+// on-screen keyboard on every browser.
+const DROPDOWN_FALLBACK_MAX_HEIGHT = '40dvh';
+
+// Measures the space between `wrapperRef`'s bottom edge and the bottom of
+// the visual viewport (i.e. above the on-screen keyboard, not the full
+// layout viewport), recomputing on every visualViewport resize/scroll while
+// `isOpen` — the keyboard showing/hiding fires exactly those events. Returns
+// null when VisualViewport isn't supported, so callers can fall back to a
+// dvh-based CSS max-height instead.
+const useDropdownMaxHeight = (wrapperRef, isOpen) => {
+  const [maxHeight, setMaxHeight] = useState(null);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (!vv) {
+      setMaxHeight(null);
+      return undefined;
+    }
+    const recompute = () => {
+      if (!wrapperRef.current) return;
+      const rect = wrapperRef.current.getBoundingClientRect();
+      const visibleBottom = vv.offsetTop + vv.height;
+      setMaxHeight(Math.max(0, visibleBottom - rect.bottom - DROPDOWN_BOTTOM_MARGIN));
+    };
+    recompute();
+    vv.addEventListener('resize', recompute);
+    vv.addEventListener('scroll', recompute);
+    return () => {
+      vv.removeEventListener('resize', recompute);
+      vv.removeEventListener('scroll', recompute);
+    };
+  }, [isOpen, wrapperRef]);
+
+  return maxHeight;
 };
 
 const SPEED_UNIT_OPTIONS = [
@@ -228,9 +347,18 @@ const buildCumulativeSpanDurations = (points, spans, cumulativeDistance, totalDu
 // HERE's spans array is sorted by ascending offset (start point index of each
 // span) — the last span whose offset hasn't passed `index` yet is the one
 // the driver is currently on.
+//
+// The response field is `maxSpeed`, not `speedLimit` — per HERE Routing API
+// v8's own OpenAPI spec, `speedLimit` is a deprecated alias that only
+// appears if the request explicitly asks for spans=speedLimit; requesting
+// spans=maxSpeed (as this app does) returns spans with a `maxSpeed` field
+// instead, and reading `.speedLimit` off of them is always undefined. Its
+// value is either a number in m/s, or the literal string "unlimited" (e.g.
+// German autobahns) per the MaxSpeed schema — both are passed through here
+// and disambiguated at render time.
 const speedLimitAtIndex = (spans, index) => {
   for (let s = spans.length - 1; s >= 0; s--) {
-    if (spans[s].offset <= index) return spans[s].speedLimit ?? null;
+    if (spans[s].offset <= index) return spans[s].maxSpeed ?? null;
   }
   return null;
 };
@@ -293,7 +421,26 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const navActionsRef = useRef([]);
   const lastIndexRef = useRef(0);
   const lastPositionRef = useRef(null);
+  const lastFixTimestampRef = useRef(null);
+  // Last heading target accepted by the low-speed gate (route-bearing or
+  // GPS-diff derived) — the animation's "to" heading each fix.
+  const smoothedHeadingRef = useRef(null);
+  // The marker/camera pose actually on screen right now (post-interpolation)
+  // — the animation's "from" anchor for the next leg, and what a mid-flight
+  // new fix animates onward from instead of the fix's raw point.
+  const displayedPoseRef = useRef(null);
+  // { fromLat, fromLng, fromHeading, toLat, toLng, toHeading, startTime,
+  //   duration, settled } for the requestAnimationFrame loop below.
+  const navAnimRef = useRef(null);
+  const navRafRef = useRef(null);
   const recalculatingRef = useRef(false);
+  // Consecutive fixes in a row measured > REROUTE_TRIGGER_METERS from the
+  // route — reset to 0 the moment a fix comes back within range.
+  const offRouteStreakRef = useRef(0);
+  // Date.now() of the last reroute attempt (success or failure) — gates the
+  // cooldown in REROUTE_COOLDOWN_MS.
+  const lastRerouteAttemptRef = useRef(0);
+  const rerouteNoticeTimeoutRef = useRef(null);
   const routeStartRef = useRef(null);
   const routeEndRef = useRef(null);
   const routeDropdownRef = useRef(null);
@@ -317,12 +464,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const endRequestId = useRef(0);
   const startResolvedRef = useRef(null);
   const endResolvedRef = useRef(null);
+  // Most recent real GPS fix (from the mount-time one-shot below), used to
+  // bias autosuggest ranking toward the driver's actual location instead of
+  // the app's fixed center-of-Canada default.
+  const driverPositionRef = useRef(null);
   const [startLocation, setStartLocation] = useState('');
   const [endLocation, setEndLocation] = useState('');
   const [startSuggestions, setStartSuggestions] = useState([]);
   const [endSuggestions, setEndSuggestions] = useState([]);
   const [startSuggestLoading, setStartSuggestLoading] = useState(false);
   const [endSuggestLoading, setEndSuggestLoading] = useState(false);
+  // "See more" state — collapsed (top SUGGESTION_VISIBLE_COUNT) until tapped.
+  const [startSuggestionsExpanded, setStartSuggestionsExpanded] = useState(false);
+  const [endSuggestionsExpanded, setEndSuggestionsExpanded] = useState(false);
   const [searching, setSearching] = useState(false);
   const [routeOptions, setRouteOptions] = useState([]);
   const [selectedRouteId, setSelectedRouteId] = useState(null);
@@ -330,6 +484,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const [inspectionStationCount, setInspectionStationCount] = useState(0);
   const [navigating, setNavigating] = useState(false);
   const [recalculating, setRecalculating] = useState(false);
+  // { type: 'success' | 'failed', text } | null — post-attempt reroute
+  // feedback shown once `recalculating` clears. 'success' auto-dismisses;
+  // 'failed' stays up until the next attempt resolves one way or the other.
+  const [rerouteNotice, setRerouteNotice] = useState(null);
   const [currentInstruction, setCurrentInstruction] = useState(null);
   const [nextInstruction, setNextInstruction] = useState(null);
   const [toastAlert, setToastAlert] = useState(null);
@@ -342,7 +500,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const [speedUnit, setSpeedUnit] = useState('auto');
   const [autoUnit, setAutoUnit] = useState('kmh');
   const [currentSpeedMps, setCurrentSpeedMps] = useState(null);
-  const [currentSpeedLimitMps, setCurrentSpeedLimitMps] = useState(null);
+  // Number (m/s), the literal string 'unlimited' (see speedLimitAtIndex), or
+  // null when unknown.
+  const [currentSpeedLimit, setCurrentSpeedLimit] = useState(null);
   const [tripStats, setTripStats] = useState(null);
   const [savedRoutes, setSavedRoutes] = useState([]);
   const [showRouteDropdown, setShowRouteDropdown] = useState(false);
@@ -541,6 +701,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         if (cancelled) return;
         const { latitude, longitude } = position.coords;
         const geoPosition = { lat: latitude, lng: longitude };
+        driverPositionRef.current = geoPosition;
         const fallbackText = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
         if (!platformRef.current) {
           applyStart(fallbackText, geoPosition);
@@ -647,11 +808,26 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
   // Autosuggest (not Geocode) so business names/landmarks like "Canadian Tire
   // Motorsport Park" resolve, not just structured street addresses.
+  // Proximity bias for autosuggest ranking (the `at` param — this only
+  // re-ranks results, it doesn't exclude anything outside it, so it's safe
+  // to combine with the `in: countryCode:CAN` scope below). Prefers a real
+  // GPS fix; falls back to the map's current center rather than sending no
+  // bias at all, and only falls all the way back to the fixed center-of-
+  // Canada point if neither is available yet (e.g. before the map mounts).
+  const getSearchBias = () => {
+    if (driverPositionRef.current) {
+      return `${driverPositionRef.current.lat},${driverPositionRef.current.lng}`;
+    }
+    const center = mapInstance.current?.getCenter();
+    if (center) return `${center.lat},${center.lng}`;
+    return '56.1304,-106.3468';
+  };
+
   const resolveLocation = (query) => new Promise((resolve, reject) => {
     platformRef.current.getSearchService().autosuggest({
       q: query,
       in: 'countryCode:CAN',
-      at: '56.1304,-106.3468',
+      at: getSearchBias(),
       limit: 5
     }, (result) => {
       const match = (result.items || []).find((item) => item.position);
@@ -672,11 +848,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     platformRef.current.getSearchService().autosuggest({
       q: query,
       in: 'countryCode:CAN',
-      at: '56.1304,-106.3468',
-      limit: 5
+      at: getSearchBias(),
+      limit: SUGGESTION_FETCH_LIMIT
     }, (result) => {
       if (requestIdRef.current !== myRequestId) return;
-      const matches = (result.items || []).filter((item) => item.position && item.title).slice(0, 3);
+      const matches = (result.items || []).filter((item) => item.position && item.title);
       setSuggestions(matches);
       setLoading(false);
     }, () => {
@@ -689,6 +865,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const value = e.target.value;
     setStartLocation(value);
     if (startResolvedRef.current?.text !== value) startResolvedRef.current = null;
+    setStartSuggestionsExpanded(false);
     clearTimeout(startSuggestTimeout.current);
     startSuggestTimeout.current = setTimeout(() => {
       fetchSuggestions(value, setStartSuggestions, setStartSuggestLoading, startRequestId);
@@ -699,6 +876,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const value = e.target.value;
     setEndLocation(value);
     if (endResolvedRef.current?.text !== value) endResolvedRef.current = null;
+    setEndSuggestionsExpanded(false);
     clearTimeout(endSuggestTimeout.current);
     endSuggestTimeout.current = setTimeout(() => {
       fetchSuggestions(value, setEndSuggestions, setEndSuggestLoading, endRequestId);
@@ -710,6 +888,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     setStartLocation(text);
     startResolvedRef.current = { text, position: { lat: item.position.lat, lng: item.position.lng } };
     setStartSuggestions([]);
+    setStartSuggestionsExpanded(false);
   };
 
   const selectEndSuggestion = (item) => {
@@ -717,6 +896,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     setEndLocation(text);
     endResolvedRef.current = { text, position: { lat: item.position.lat, lng: item.position.lng } };
     setEndSuggestions([]);
+    setEndSuggestionsExpanded(false);
   };
 
   const openWeighStationBubble = (marker, station) => {
@@ -872,9 +1052,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   };
 
   const calculateSingleRoute = (router, params) => new Promise((resolve, reject) => {
+    // Diagnostic for the "LIMIT UNKNOWN" speed-limit bug: the HERE JS SDK
+    // doesn't expose the raw HTTP request it issues, so this reconstructs
+    // the equivalent v8 REST URL (minus the API key) purely for console
+    // inspection, and logs a sample of the first section's spans as
+    // actually returned — confirms both that `spans=maxSpeed` really goes
+    // out on the wire and what the response spans look like.
+    const debugUrl = `https://router.hereapi.com/v8/routes?${new URLSearchParams(params).toString()}`;
+    console.log('[routing] request URL:', debugUrl);
     router.calculateRoute(params, (result) => {
-      if (result.routes?.length) resolve(result.routes[0]);
-      else reject(new Error('No route found'));
+      if (result.routes?.length) {
+        const spans = result.routes[0].sections?.[0]?.spans;
+        console.log('[routing] response spans sample:', spans?.slice(0, 5) ?? '(no spans in response)');
+        resolve(result.routes[0]);
+      } else reject(new Error('No route found'));
     }, (err) => reject(err));
   });
 
@@ -1072,6 +1263,42 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     });
   };
 
+  // Single place that actually paints a driver pose — feeds the exact same
+  // heading value to both the marker icon rotation and the map's course-up
+  // bearing so they can never drift apart, then records what's now on
+  // screen as the animation's next "from" anchor.
+  const renderDriverPose = (lat, lng, headingDeg) => {
+    const pos = { lat, lng };
+    if (!driverMarkerRef.current) {
+      driverMarkerRef.current = new H.map.Marker(pos, { icon: createDriverIcon(headingDeg) });
+      mapInstance.current.addObject(driverMarkerRef.current);
+    } else {
+      driverMarkerRef.current.setGeometry(pos);
+      driverMarkerRef.current.setIcon(createDriverIcon(headingDeg));
+    }
+    updateNavCamera(lat, lng, headingDeg);
+    displayedPoseRef.current = { lat, lng, heading: headingDeg };
+  };
+
+  // Runs continuously while navigating, animating the marker/camera from
+  // their last on-screen pose to the latest GPS fix over the interval
+  // between fixes, instead of snapping on every ~1s watchPosition callback.
+  // Heading interpolates along the shortest angular path so a 359°→1° turn
+  // doesn't spin the long way round.
+  const stepNavAnimation = () => {
+    const anim = navAnimRef.current;
+    if (anim && !anim.settled) {
+      const now = performance.now();
+      const t = anim.duration > 0 ? Math.min(1, (now - anim.startTime) / anim.duration) : 1;
+      const lat = anim.fromLat + (anim.toLat - anim.fromLat) * t;
+      const lng = anim.fromLng + (anim.toLng - anim.fromLng) * t;
+      const heading = normalizeDegrees(anim.fromHeading + shortestAngleDelta(anim.fromHeading, anim.toHeading) * t);
+      renderDriverPose(lat, lng, heading);
+      if (t >= 1) anim.settled = true;
+    }
+    navRafRef.current = requestAnimationFrame(stepNavAnimation);
+  };
+
   const applyNavRoute = (section) => {
     const points = decodeRoutePoints(section.polyline);
     const cumulative = buildCumulativeDistances(points);
@@ -1125,7 +1352,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       const destination = routeEndRef.current;
       if (!destination || !platformRef.current) return;
       const router = platformRef.current.getRoutingService(null, 8);
-      const route = await calculateSingleRoute(router, {
+      const rerouteParams = {
         origin: `${lat},${lng}`,
         destination: `${destination.lat},${destination.lng}`,
         transportMode: 'truck',
@@ -1139,10 +1366,30 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         'vehicle[width]': (profile?.width || 2.5) * 100,
         'vehicle[length]': (profile?.length || 15) * 100,
         'vehicle[axleCount]': profile?.axles || 5
+      };
+      // Explicit, separate-from-the-generic-request-log confirmation that
+      // the reroute carries the same dimensional/weight constraints as the
+      // original route — dropping these on a reroute could send an oversize
+      // load onto a restricted road or under a low bridge.
+      console.log('[reroute] transportMode:', rerouteParams.transportMode, 'vehicle params:', {
+        grossWeight: rerouteParams['vehicle[grossWeight]'],
+        height: rerouteParams['vehicle[height]'],
+        width: rerouteParams['vehicle[width]'],
+        length: rerouteParams['vehicle[length]'],
+        axleCount: rerouteParams['vehicle[axleCount]']
       });
+      const route = await calculateSingleRoute(router, rerouteParams);
       applyNavRoute(route.sections[0]);
+      offRouteStreakRef.current = 0;
+      clearTimeout(rerouteNoticeTimeoutRef.current);
+      setRerouteNotice({ type: 'success', text: 'New route active' });
+      rerouteNoticeTimeoutRef.current = setTimeout(() => {
+        setRerouteNotice((current) => (current?.type === 'success' ? null : current));
+      }, REROUTE_SUCCESS_NOTICE_MS);
     } catch (err) {
       console.error('Recalculation failed:', err);
+      clearTimeout(rerouteNoticeTimeoutRef.current);
+      setRerouteNotice({ type: 'failed', text: "Rerouting failed — couldn't reach the routing service. Retrying…" });
     } finally {
       setRecalculating(false);
     }
@@ -1154,34 +1401,100 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   };
 
   const handlePositionUpdate = (position) => {
-    const { latitude, longitude, heading } = position.coords;
+    const { latitude, longitude, speed } = position.coords;
     const currentPos = { lat: latitude, lng: longitude };
     const prev = lastPositionRef.current;
-    const effectiveHeading = (typeof heading === 'number' && !Number.isNaN(heading))
-      ? heading
-      : (prev ? bearingDegrees(prev, currentPos) : 0);
+    const prevTimestamp = lastFixTimestampRef.current;
     lastPositionRef.current = currentPos;
-
-    if (!driverMarkerRef.current) {
-      driverMarkerRef.current = new H.map.Marker(currentPos, { icon: createDriverIcon(effectiveHeading) });
-      mapInstance.current.addObject(driverMarkerRef.current);
-    } else {
-      driverMarkerRef.current.setGeometry(currentPos);
-      driverMarkerRef.current.setIcon(createDriverIcon(effectiveHeading));
-    }
-
-    updateNavCamera(latitude, longitude, effectiveHeading);
+    lastFixTimestampRef.current = position.timestamp;
+    driverPositionRef.current = currentPos;
 
     const points = navRoutePointsRef.current;
     const cumulative = navCumulativeRef.current;
+
+    let index = lastIndexRef.current;
+    let distance = 0;
+    if (points && points.length) {
+      ({ index, distance } = nearestPointIndex(points, latitude, longitude, lastIndexRef.current, 80));
+      lastIndexRef.current = index;
+    }
+    const onRoute = Boolean(points && points.length) && distance <= OFF_ROUTE_METERS;
+
+    const speedMps = typeof speed === 'number' && !Number.isNaN(speed) ? Math.max(0, speed) : null;
+    // coords.speed isn't reported by every browser/device — fall back to
+    // distance/time between fixes so the low-speed heading gate below still
+    // has something to check against.
+    const estimatedSpeedMps = speedMps != null
+      ? speedMps
+      : (prev && prevTimestamp
+        ? haversineMeters(prev, currentPos) / Math.max(0.001, (position.timestamp - prevTimestamp) / 1000)
+        : null);
+
+    // Raw GeolocationPosition.coords.heading is intentionally never used
+    // here — it's often null, and even when present is frequently noisy or
+    // outright wrong at low/moderate truck speed. See deriveTargetHeading.
+    const rawHeading = deriveTargetHeading(onRoute, points, cumulative, index, prev, currentPos);
+    const belowHeadingSpeed = estimatedSpeedMps != null && estimatedSpeedMps < MIN_HEADING_SPEED_MPS;
+    if (rawHeading != null && (!belowHeadingSpeed || smoothedHeadingRef.current == null)) {
+      if (onRoute || smoothedHeadingRef.current == null) {
+        // Route-derived heading only changes when the matched index moves
+        // onto a genuinely different-angled segment, so it's applied
+        // directly — smoothing it would just add lag to real turns.
+        smoothedHeadingRef.current = rawHeading;
+      } else {
+        // The off-route fallback (bearing between consecutive GPS fixes) is
+        // noisier, so it's eased in via a rolling blend rather than applied
+        // directly, per-fix jitter gets damped while real direction changes
+        // still come through within a couple of fixes.
+        smoothedHeadingRef.current = normalizeDegrees(
+          smoothedHeadingRef.current + shortestAngleDelta(smoothedHeadingRef.current, rawHeading) * 0.4
+        );
+      }
+    }
+    const targetHeading = smoothedHeadingRef.current ?? 0;
+
+    const isFirstFix = displayedPoseRef.current == null;
+    const fromPose = isFirstFix ? { lat: latitude, lng: longitude, heading: targetHeading } : displayedPoseRef.current;
+    const rawDuration = prevTimestamp ? position.timestamp - prevTimestamp : NAV_ANIM_DEFAULT_MS;
+    const duration = isFirstFix ? 0 : Math.min(NAV_ANIM_MAX_MS, Math.max(NAV_ANIM_MIN_MS, rawDuration || NAV_ANIM_DEFAULT_MS));
+    navAnimRef.current = {
+      fromLat: fromPose.lat,
+      fromLng: fromPose.lng,
+      fromHeading: fromPose.heading,
+      toLat: latitude,
+      toLng: longitude,
+      toHeading: targetHeading,
+      startTime: performance.now(),
+      duration,
+      settled: false
+    };
+    if (isFirstFix) {
+      // Nothing rendered yet to animate from — paint the first fix immediately.
+      renderDriverPose(latitude, longitude, targetHeading);
+    }
+
     if (!points || !points.length) return;
 
-    const { index, distance } = nearestPointIndex(points, latitude, longitude, lastIndexRef.current, 80);
-    lastIndexRef.current = index;
+    // Hysteresis: a single fix past REROUTE_TRIGGER_METERS only starts the
+    // streak — it takes REROUTE_CONFIRM_FIXES in a row (a few seconds of
+    // GPS fixes) before a reroute is actually confirmed, so one noisy fix
+    // or a wide lane doesn't fire it. Any fix back within range resets it.
+    if (distance > REROUTE_TRIGGER_METERS) {
+      offRouteStreakRef.current += 1;
+    } else {
+      offRouteStreakRef.current = 0;
+    }
 
-    if (distance > OFF_ROUTE_METERS) {
-      if (!recalculatingRef.current) {
+    if (offRouteStreakRef.current >= REROUTE_CONFIRM_FIXES) {
+      const now = Date.now();
+      const cooldownElapsed = now - lastRerouteAttemptRef.current >= REROUTE_COOLDOWN_MS;
+      // recalculatingRef guards against overlapping in-flight requests;
+      // cooldownElapsed rate-limits attempts (including retries after a
+      // failure) to at most one every REROUTE_COOLDOWN_MS, rather than
+      // firing again on literally the next ~1s GPS fix while still off-route.
+      if (!recalculatingRef.current && cooldownElapsed) {
         recalculatingRef.current = true;
+        lastRerouteAttemptRef.current = now;
         setRecalculating(true);
         recalculateFromCurrentPosition(latitude, longitude).finally(() => {
           recalculatingRef.current = false;
@@ -1197,11 +1510,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     setCurrentInstruction(next ? { text: next.text, distanceMeters: Math.max(0, next.distanceMeters - travelled) } : null);
     setNextInstruction(after ? { text: after.text } : null);
 
-    const speedMps = typeof position.coords.speed === 'number' && !Number.isNaN(position.coords.speed)
-      ? Math.max(0, position.coords.speed)
-      : null;
     setCurrentSpeedMps(speedMps);
-    setCurrentSpeedLimitMps(speedLimitAtIndex(navSpansRef.current, index));
+    setCurrentSpeedLimit(speedLimitAtIndex(navSpansRef.current, index));
 
     const totalLength = navTotalLengthRef.current;
     const totalDuration = navTotalDurationRef.current;
@@ -1275,18 +1585,26 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
     setError('');
     setRecalculating(false);
+    clearTimeout(rerouteNoticeTimeoutRef.current);
+    setRerouteNotice(null);
     setCurrentInstruction(null);
     setNextInstruction(null);
     setToastAlert(null);
     setBannerAlert(null);
     setCurrentSpeedMps(null);
-    setCurrentSpeedLimitMps(null);
+    setCurrentSpeedLimit(null);
     setTripStats(null);
     setOptionsMenuOpen(false);
     setSpeedUnitMenuOpen(false);
     lastPositionRef.current = null;
     lastIndexRef.current = 0;
+    lastFixTimestampRef.current = null;
+    smoothedHeadingRef.current = null;
+    displayedPoseRef.current = null;
+    navAnimRef.current = null;
     recalculatingRef.current = false;
+    offRouteStreakRef.current = 0;
+    lastRerouteAttemptRef.current = 0;
 
     mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
     applyNavRoute(selected.section);
@@ -1298,6 +1616,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       maximumAge: 0,
       timeout: 20000
     });
+    navRafRef.current = requestAnimationFrame(stepNavAnimation);
   };
 
   const stopNavigation = () => {
@@ -1305,6 +1624,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+    if (navRafRef.current != null) {
+      cancelAnimationFrame(navRafRef.current);
+      navRafRef.current = null;
+    }
+    navAnimRef.current = null;
+    displayedPoseRef.current = null;
     if (driverMarkerRef.current) {
       mapInstance.current.removeObject(driverMarkerRef.current);
       driverMarkerRef.current = null;
@@ -1324,12 +1649,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     setNavigating(false);
     onNavigatingChange?.(false);
     setRecalculating(false);
+    clearTimeout(rerouteNoticeTimeoutRef.current);
+    setRerouteNotice(null);
     setCurrentInstruction(null);
     setNextInstruction(null);
     setToastAlert(null);
     setBannerAlert(null);
     setCurrentSpeedMps(null);
-    setCurrentSpeedLimitMps(null);
+    setCurrentSpeedLimit(null);
     setTripStats(null);
 
     const selected = routeOptions.find((opt) => opt.id === selectedRouteId);
@@ -1345,6 +1672,15 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
   // Top section shows the 3 most-loaded routes; "See more" reveals the rest.
   // A search query overrides both and filters by name across all routes.
+  const startDropdownOpen = startSuggestLoading || startSuggestions.length > 0;
+  const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
+  const startDropdownMaxHeight = useDropdownMaxHeight(startWrapperRef, startDropdownOpen);
+  const endDropdownMaxHeight = useDropdownMaxHeight(endWrapperRef, endDropdownOpen);
+  const startDropdownMaxHeightStyle = startDropdownMaxHeight != null ? `${startDropdownMaxHeight}px` : DROPDOWN_FALLBACK_MAX_HEIGHT;
+  const endDropdownMaxHeightStyle = endDropdownMaxHeight != null ? `${endDropdownMaxHeight}px` : DROPDOWN_FALLBACK_MAX_HEIGHT;
+  const visibleStartSuggestions = startSuggestionsExpanded ? startSuggestions : startSuggestions.slice(0, SUGGESTION_VISIBLE_COUNT);
+  const visibleEndSuggestions = endSuggestionsExpanded ? endSuggestions : endSuggestions.slice(0, SUGGESTION_VISIBLE_COUNT);
+
   const trimmedRouteSearch = routeSearchQuery.trim().toLowerCase();
   const displayedSavedRoutes = trimmedRouteSearch
     ? savedRoutes.filter((r) => r.route_name.toLowerCase().includes(trimmedRouteSearch))
@@ -1540,9 +1876,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   </div>
                   <div style={{ ...LABEL_STYLE, borderTop: '1px solid var(--color-grid-line)', paddingTop: '6px' }}>
                     LIMIT{' '}
-                    {currentSpeedLimitMps != null ? (
+                    {currentSpeedLimit === 'unlimited' ? (
                       <span style={{ ...MONO_STYLE, textTransform: 'none', color: 'var(--color-text-primary)', fontWeight: 600 }}>
-                        {formatSpeedValue(currentSpeedLimitMps, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
+                        no limit
+                      </span>
+                    ) : currentSpeedLimit != null ? (
+                      <span style={{ ...MONO_STYLE, textTransform: 'none', color: 'var(--color-text-primary)', fontWeight: 600 }}>
+                        {formatSpeedValue(currentSpeedLimit, effectiveSpeedUnit)} {unitLabel(effectiveSpeedUnit)}
                       </span>
                     ) : (
                       <span style={{ color: 'var(--color-text-muted)' }}>unknown</span>
@@ -1552,7 +1892,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               </div>
             </div>
 
-            {recalculating && (
+            {recalculating ? (
               <div
                 style={{
                   alignSelf: 'center',
@@ -1568,7 +1908,25 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   fontWeight: 700
                 }}
               >
-                Recalculating…
+                Rerouting…
+              </div>
+            ) : rerouteNotice && (
+              <div
+                style={{
+                  alignSelf: 'center',
+                  marginTop: '8px',
+                  background: rerouteNotice.type === 'failed' ? '#dc2626' : '#16a34a',
+                  color: 'white',
+                  padding: '8px 16px',
+                  borderRadius: 'var(--radius-soft)',
+                  fontFamily: 'var(--font-display)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  fontSize: '13px',
+                  fontWeight: 700
+                }}
+              >
+                {rerouteNotice.text}
               </div>
             )}
 
@@ -1900,7 +2258,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onChange={handleStartChange}
             style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
-          {(startSuggestLoading || startSuggestions.length > 0) && (
+          {startDropdownOpen && (
             <div
               onMouseEnter={() => { startInteractingRef.current = true; }}
               onMouseLeave={() => { startInteractingRef.current = false; }}
@@ -1914,24 +2272,39 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 border: '1px solid var(--color-border)',
                 borderRadius: 'var(--radius-soft)',
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-                marginTop: '2px'
+                marginTop: '2px',
+                maxHeight: startDropdownMaxHeightStyle,
+                overflowY: 'auto'
               }}
             >
               {startSuggestLoading ? (
-                <div style={{ padding: '8px', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
+                <div style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
               ) : (
-                startSuggestions.map((item) => (
-                  <div
-                    key={item.id}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      selectStartSuggestion(item);
-                    }}
-                    style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
-                  >
-                    {formatSuggestion(item)}
-                  </div>
-                ))
+                <>
+                  {visibleStartSuggestions.map((item) => (
+                    <div
+                      key={item.id}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        selectStartSuggestion(item);
+                      }}
+                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
+                    >
+                      {formatSuggestion(item)}
+                    </div>
+                  ))}
+                  {!startSuggestionsExpanded && startSuggestions.length > SUGGESTION_VISIBLE_COUNT && (
+                    <div
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setStartSuggestionsExpanded(true);
+                      }}
+                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', color: '#e85d04', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}
+                    >
+                      See more ({startSuggestions.length - SUGGESTION_VISIBLE_COUNT} more)
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -1944,7 +2317,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onChange={handleEndChange}
             style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
-          {(endSuggestLoading || endSuggestions.length > 0) && (
+          {endDropdownOpen && (
             <div
               onMouseEnter={() => { endInteractingRef.current = true; }}
               onMouseLeave={() => { endInteractingRef.current = false; }}
@@ -1958,24 +2331,39 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 border: '1px solid var(--color-border)',
                 borderRadius: 'var(--radius-soft)',
                 boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-                marginTop: '2px'
+                marginTop: '2px',
+                maxHeight: endDropdownMaxHeightStyle,
+                overflowY: 'auto'
               }}
             >
               {endSuggestLoading ? (
-                <div style={{ padding: '8px', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
+                <div style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
               ) : (
-                endSuggestions.map((item) => (
-                  <div
-                    key={item.id}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      selectEndSuggestion(item);
-                    }}
-                    style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
-                  >
-                    {formatSuggestion(item)}
-                  </div>
-                ))
+                <>
+                  {visibleEndSuggestions.map((item) => (
+                    <div
+                      key={item.id}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        selectEndSuggestion(item);
+                      }}
+                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
+                    >
+                      {formatSuggestion(item)}
+                    </div>
+                  ))}
+                  {!endSuggestionsExpanded && endSuggestions.length > SUGGESTION_VISIBLE_COUNT && (
+                    <div
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setEndSuggestionsExpanded(true);
+                      }}
+                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', color: '#e85d04', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}
+                    >
+                      See more ({endSuggestions.length - SUGGESTION_VISIBLE_COUNT} more)
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}

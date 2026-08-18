@@ -82,6 +82,34 @@ function App() {
     return () => subscription?.unsubscribe();
   }, []);
 
+  // Loads the driver's saved truck dimensions as soon as they're signed in,
+  // so routing (and rerouting) uses their real vehicle profile from the
+  // start of the session instead of silently falling back to Map.jsx's
+  // generic defaults until they happen to reopen the profile drawer and hit
+  // Save. Mirrors VehicleProfile.jsx's own load query; leaves `profile` at
+  // its null default (same fallback-to-defaults behavior as before) if the
+  // driver hasn't saved a profile yet.
+  useEffect(() => {
+    if (!user) {
+      setProfile(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('vehicle_profiles')
+          .select('*')
+          .eq('user_id', user.id)
+          .single();
+        if (!cancelled && !error && data) setProfile(data);
+      } catch (err) {
+        console.error('Failed to load vehicle profile:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
   if (loading) return <div>Loading...</div>;
 
   return (
