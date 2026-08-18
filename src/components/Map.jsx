@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { supabase } from '../lib/supabase';
 import { getStationsNearRoute } from '../lib/inspectionStations';
@@ -403,6 +403,86 @@ const SuggestionDropdown = ({ wrapperRef, isOpen, loading, results, expanded, on
   );
 };
 
+// Same pattern as the autosuggest dropdown fix, applied to the two other
+// spots that turned out to have the identical bug: an ancestor with
+// max-height + overflow clipping content mid-element, sized against 100vh
+// rather than what's actually visible once mobile browser chrome (and, for
+// the route card, the keyboard) is accounted for.
+//
+// How much vertical room is actually available in the visible viewport
+// after reserving `margin` px top and bottom — accounts for the on-screen
+// keyboard via VisualViewport (keyboard show/hide fires resize/scroll on
+// it) and, on browsers where VisualViewport already excludes it, mobile
+// browser chrome like Safari's collapsing bottom bar. Falls back to
+// window.innerHeight where VisualViewport isn't supported; the caller is
+// expected to also apply env(safe-area-inset-*) in CSS for the static
+// home-indicator/notch reservation, which this can't see from JS.
+const useAvailableViewportHeight = (margin) => {
+  const [height, setHeight] = useState(null);
+
+  useEffect(() => {
+    const recompute = () => {
+      const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+      const visibleHeight = vv ? vv.height : window.innerHeight;
+      setHeight(Math.max(0, visibleHeight - margin * 2));
+    };
+    recompute();
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    vv?.addEventListener('resize', recompute);
+    vv?.addEventListener('scroll', recompute);
+    window.addEventListener('resize', recompute);
+    return () => {
+      vv?.removeEventListener('resize', recompute);
+      vv?.removeEventListener('scroll', recompute);
+      window.removeEventListener('resize', recompute);
+    };
+  }, [margin]);
+
+  return height;
+};
+
+// Caps the route-options list to an exact multiple of ROUTE_OPTION_ROW_HEIGHT
+// so it can never show a fraction of a row at rest — the same guarantee
+// layoutSuggestionRows makes for the autosuggest dropdown, adapted for a
+// small (max 3-item) list that just needs to scroll rather than paginate.
+// header/footer are measured via ResizeObserver (not a hand-maintained
+// dependency list) so any change to their content — the saved-routes
+// dropdown opening, an error message appearing, the station-count warning
+// showing — automatically re-triggers the calculation.
+const useOptionsListHeight = (headerRef, footerRef, cardMaxHeight, itemCount, rowHeight) => {
+  const [height, setHeight] = useState(null);
+
+  useLayoutEffect(() => {
+    if (!itemCount || cardMaxHeight == null) {
+      setHeight(null);
+      return undefined;
+    }
+    const recompute = () => {
+      if (!headerRef.current || !footerRef.current) return;
+      const headerH = headerRef.current.getBoundingClientRect().height;
+      const footerH = footerRef.current.getBoundingClientRect().height;
+      const available = Math.max(0, cardMaxHeight - headerH - footerH - CARD_VERTICAL_PADDING);
+      const desired = itemCount * rowHeight;
+      const rowsThatFit = Math.floor(available / rowHeight);
+      setHeight(Math.min(desired, Math.max(0, rowsThatFit) * rowHeight));
+    };
+    recompute();
+    const ro = new ResizeObserver(recompute);
+    if (headerRef.current) ro.observe(headerRef.current);
+    if (footerRef.current) ro.observe(footerRef.current);
+    return () => ro.disconnect();
+  }, [itemCount, cardMaxHeight, rowHeight, headerRef, footerRef]);
+
+  return height;
+};
+
+const CARD_MARGIN = 16;
+// PANEL_STYLE-driven padding on .mt-route-card (16px top + 16px bottom).
+const CARD_VERTICAL_PADDING = 32;
+const ROUTE_OPTION_ROW_HEIGHT = 56;
+const PERMIT_PANEL_MARGIN = 20;
+const PERMIT_PANEL_MAX_HEIGHT = 230;
+
 const SPEED_UNIT_OPTIONS = [
   { value: 'auto', label: 'Auto-detect (default)' },
   { value: 'kmh', label: 'Kilometers per hour' },
@@ -589,6 +669,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const autoUnitIntervalRef = useRef(null);
   const wakeLockRef = useRef(null);
   const optionsMenuRef = useRef(null);
+  const routeCardHeaderRef = useRef(null);
+  const routeCardFooterRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -1295,6 +1377,26 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         };
       });
 
+      // Confirms whether Fastest/No Tolls/Shortest are actually distinct
+      // routes or coincidentally-equal stats: length/duration alone can't
+      // tell the two apart (two genuinely different roads can happen to be
+      // the same distance), so this also compares the raw encoded polyline
+      // — identical strings mean HERE returned the literal same route for
+      // more than one config, not just a same-length alternative.
+      console.log('[routing] route option comparison:', options.map((opt) => ({
+        id: opt.id,
+        routingMode: ROUTE_CONFIGS.find((c) => c.id === opt.id)?.routingMode,
+        avoidedTolls: Boolean(ROUTE_CONFIGS.find((c) => c.id === opt.id)?.avoidTolls),
+        km: opt.km,
+        durationText: opt.durationText,
+        hasTolls: opt.hasTolls,
+        polylineLength: opt.section.polyline.length
+      })));
+      const uniquePolylines = new Set(options.map((opt) => opt.section.polyline));
+      if (uniquePolylines.size < options.length) {
+        console.warn(`[routing] ${options.length - uniquePolylines.size} of ${options.length} route option(s) returned the exact same polyline as another option — HERE genuinely returned identical routes for those configs, not just coincidentally-equal stats.`);
+      }
+
       options.forEach((opt, index) => {
         opt.polyline.setStyle(index === 0 ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
       });
@@ -1810,6 +1912,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const startDropdownOpen = startSuggestLoading || startSuggestions.length > 0;
   const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
 
+  const routeCardMaxHeight = useAvailableViewportHeight(CARD_MARGIN);
+  const routeOptionsListHeight = useOptionsListHeight(routeCardHeaderRef, routeCardFooterRef, routeCardMaxHeight, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
+  const permitPanelAvailableHeight = useAvailableViewportHeight(PERMIT_PANEL_MARGIN);
+  const permitPanelMaxHeight = permitPanelAvailableHeight == null ? PERMIT_PANEL_MAX_HEIGHT : Math.min(PERMIT_PANEL_MAX_HEIGHT, permitPanelAvailableHeight);
+
   const trimmedRouteSearch = routeSearchQuery.trim().toLowerCase();
   const displayedSavedRoutes = trimmedRouteSearch
     ? savedRoutes.filter((r) => r.route_name.toLowerCase().includes(trimmedRouteSearch))
@@ -1835,13 +1942,25 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             left: 16px !important;
             top: 16px !important;
             width: min(320px, calc(100vw - 104px)) !important;
-            max-height: calc(100vh - 32px) !important;
-            overflow-y: auto !important;
+            /* min() of a safe-area-aware CSS fallback and --card-max-height
+               (this component's own VisualViewport measurement, set as an
+               inline custom property — see the style object above) so the
+               card is bounded by whichever is actually tighter: relevant
+               before the JS measurement lands on first paint, and on any
+               browser without VisualViewport (--card-max-height then stays
+               unset, so var()'s 100vh fallback makes the calc() the only
+               real constraint). The card itself no longer scrolls as a
+               whole (overflow: hidden) — its header and footer are fixed
+               size and only the route-options list in between scrolls, so
+               the Save/Start buttons below it can never be the thing that
+               gets clipped. */
+            max-height: min(calc(100vh - 32px - env(safe-area-inset-bottom, 0px)), var(--card-max-height, 100vh)) !important;
+            overflow: hidden !important;
           }
           .mt-route-card.mt-has-permits {
             /* Leaves room below for the bottom-anchored permit strip
                (230px reserved height + gaps) so the two never overlap. */
-            max-height: max(160px, calc(100vh - 354px)) !important;
+            max-height: min(max(160px, calc(100vh - 354px - env(safe-area-inset-bottom, 0px))), var(--card-max-height, 100vh)) !important;
           }
           .mt-permit-panel {
             left: 12px !important;
@@ -2277,9 +2396,23 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           borderRadius: 'var(--radius-soft)',
           padding: '16px',
           boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
-          width: '280px'
+          width: '280px',
+          // Flex column so the header and footer (route search fields /
+          // Save+Start buttons) take their natural size while the route-
+          // options list in between is the one flexible, scrollable region —
+          // same "fixed chrome, scrollable content, nothing ever half-
+          // rendered" shape as the autosuggest dropdown fix. The mobile
+          // media query below reads --card-max-height (this component's own
+          // VisualViewport-aware measurement) to bound the whole card to
+          // what's actually visible, combined via CSS min() with a
+          // safe-area-aware calc() fallback for browsers where the JS
+          // measurement hasn't landed yet.
+          display: 'flex',
+          flexDirection: 'column',
+          '--card-max-height': routeCardMaxHeight != null ? `${routeCardMaxHeight}px` : undefined
         }}
       >
+        <div ref={routeCardHeaderRef} style={{ flex: '0 0 auto' }}>
         <div ref={routeDropdownRef} style={{ position: 'relative', marginBottom: '10px' }}>
           <button
             onClick={() => setShowRouteDropdown((open) => !open)}
@@ -2451,15 +2584,28 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         >
           {searching ? 'Calculating…' : 'Find Truck Route'}
         </button>
+        </div>
         {routeOptions.length > 0 && (
-          <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div
+            style={{
+              flex: '0 0 auto',
+              height: routeOptionsListHeight != null ? `${routeOptionsListHeight}px` : `${routeOptions.length * ROUTE_OPTION_ROW_HEIGHT}px`,
+              minHeight: 0,
+              overflowY: 'auto',
+              marginTop: '10px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '8px'
+            }}
+          >
             {routeOptions.map((opt) => (
               <button
                 key={opt.id}
                 onClick={() => selectRoute(opt.id)}
                 style={{
                   textAlign: 'left',
-                  minHeight: '44px',
+                  height: `${ROUTE_OPTION_ROW_HEIGHT}px`,
+                  flex: '0 0 auto',
                   boxSizing: 'border-box',
                   padding: '10px 12px',
                   borderRadius: 0,
@@ -2470,17 +2616,18 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   fontFamily: 'var(--font-display)'
                 }}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--color-text-primary)' }}>{opt.label}</span>
-                  <span style={{ fontSize: '15px' }}>{opt.hasTolls ? '🏷️' : '✅'}</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                  <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{opt.label}</span>
+                  <span style={{ fontSize: '15px', flexShrink: 0 }}>{opt.hasTolls ? '🏷️' : '✅'}</span>
                 </div>
-                <div style={{ ...MONO_STYLE, fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                <div style={{ ...MONO_STYLE, fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {opt.km} km · {opt.durationText}
                 </div>
               </button>
             ))}
           </div>
         )}
+        <div ref={routeCardFooterRef} style={{ flex: '0 0 auto' }}>
         {routeOptions.length > 0 && (
           <button
             onClick={() => { setSaveRouteName(''); setSaveRouteError(''); setShowSaveRouteModal(true); }}
@@ -2553,6 +2700,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         {error && (
           <div style={{ marginTop: '8px', fontFamily: 'var(--font-display)', color: '#c0392b' }}>{error}</div>
         )}
+        </div>
       </div>
       )}
       {showSaveRouteModal && (
@@ -2613,7 +2761,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           className="mt-permit-panel"
           style={{
             position: 'absolute',
-            bottom: '20px',
+            // env(safe-area-inset-bottom) clears the home-indicator/gesture
+            // area on notched phones; permitPanelMaxHeight (VisualViewport-
+            // aware, see useAvailableViewportHeight) additionally shrinks
+            // the panel — and each card below, individually — when Safari's
+            // collapsible bottom bar is actually showing and eating into
+            // the visible height, rather than assuming the full static
+            // 230px is always available.
+            bottom: 'calc(20px + env(safe-area-inset-bottom, 0px))',
             left: '20px',
             right: '20px',
             // Below the route search card (2000) so the card's inputs and
@@ -2621,7 +2776,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             zIndex: 1900,
             display: 'flex',
             gap: '12px',
-            maxHeight: '230px',
+            maxHeight: `${permitPanelMaxHeight}px`,
             overflowX: 'auto',
             overflowY: 'auto',
             paddingBottom: '4px'
@@ -2639,7 +2794,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   borderRadius: 0,
                   padding: '14px',
                   fontFamily: 'var(--font-display)',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+                  boxSizing: 'border-box',
+                  maxHeight: `${permitPanelMaxHeight}px`,
+                  overflowY: 'auto'
                 }}
               >
                 <div style={{ ...LABEL_STYLE, color: 'rgba(255,255,255,0.75)', marginBottom: '4px' }}>Province</div>
