@@ -53,7 +53,7 @@ export default function MenuDrawer({ children }) {
         @media (max-width: 480px) {
           .mt-drawer {
             left: 12px !important;
-            right: 12px !important;
+            right: calc(12px + env(safe-area-inset-right)) !important;
             top: 12px !important;
             width: auto !important;
             max-width: none !important;
@@ -61,7 +61,11 @@ export default function MenuDrawer({ children }) {
         }
       `}</style>
 
-      {/* Hamburger button — always visible, top right */}
+      {/* Hamburger button — always visible, top right. `right` accounts for
+          env(safe-area-inset-right) (defaults to 0 where unsupported, so
+          this never regresses) so the full 56px button stays clear of a
+          notch/rounded-corner/gesture-area intruding from the right edge,
+          not just 16px from whatever the layout viewport's raw edge is. */}
       <button
         onClick={() => setOpen(true)}
         aria-label="Open menu"
@@ -69,7 +73,7 @@ export default function MenuDrawer({ children }) {
         style={{
           position: 'fixed',
           top: '16px',
-          right: '16px',
+          right: 'calc(16px + env(safe-area-inset-right))',
           zIndex: 4000,
           width: '56px',
           height: '56px',
@@ -104,7 +108,7 @@ export default function MenuDrawer({ children }) {
         style={{
           position: 'fixed',
           top: '16px',
-          right: '16px',
+          right: 'calc(16px + env(safe-area-inset-right))',
           zIndex: 4002,
           display: 'flex',
           height: 'auto',

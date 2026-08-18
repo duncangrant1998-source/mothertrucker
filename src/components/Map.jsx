@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { supabase } from '../lib/supabase';
 import { getStationsNearRoute } from '../lib/inspectionStations';
 import { PROVINCE_PERMITS, getProvincesForBounds } from '../lib/provincePermits';
@@ -225,47 +226,181 @@ const formatSpeedValue = (mps, unit) => {
 // short enough to fit above an on-screen keyboard.
 const SUGGESTION_FETCH_LIMIT = 8;
 const SUGGESTION_VISIBLE_COUNT = 3;
+// Every suggestion row (and the "See more" row) renders at exactly this
+// height — enforced via a fixed `height` + single-line ellipsis text, not
+// just `minHeight` — so the container's height can be computed as an exact
+// multiple of it with zero remainder. That's what guarantees no row is ever
+// half-visible: the box is never taller than a whole number of rows.
+const SUGGESTION_ROW_HEIGHT = 44;
 // Breathing room kept between the bottom of the dropdown and the edge of
 // the visible viewport (or the top of the on-screen keyboard).
 const DROPDOWN_BOTTOM_MARGIN = 8;
-// Used only on browsers without window.visualViewport — dvh (dynamic
-// viewport height) is the closest CSS-only proxy for "actually visible
-// area," though unlike VisualViewport it doesn't reliably subtract the
-// on-screen keyboard on every browser.
+// Used only for the brief window before the first position measurement
+// lands (or on a browser missing getBoundingClientRect entirely) — dvh is
+// the closest CSS-only proxy for "actually visible area."
 const DROPDOWN_FALLBACK_MAX_HEIGHT = '40dvh';
 
-// Measures the space between `wrapperRef`'s bottom edge and the bottom of
-// the visual viewport (i.e. above the on-screen keyboard, not the full
-// layout viewport), recomputing on every visualViewport resize/scroll while
-// `isOpen` — the keyboard showing/hiding fires exactly those events. Returns
-// null when VisualViewport isn't supported, so callers can fall back to a
-// dvh-based CSS max-height instead.
-const useDropdownMaxHeight = (wrapperRef, isOpen) => {
-  const [maxHeight, setMaxHeight] = useState(null);
+// Pure row-fitting logic, kept separate from rendering so it's unit-
+// testable on its own. Decides exactly which rows to show and how tall the
+// container should be, given how much vertical space is actually available:
+//  - Collapsed (default): shows up to SUGGESTION_VISIBLE_COUNT results, with
+//    a "See more" row appended if there are more. If availableHeight can't
+//    fit all of those, rows are trimmed (results before "See more" is ever
+//    dropped) so the container height is always an exact multiple of the
+//    row height — never a fraction of one, so nothing can render half-cut.
+//  - Expanded: shows everything, scrollable (overflow: 'auto') within
+//    availableHeight — the one place a partial row at the scroll boundary
+//    is expected/acceptable, same as any normal scrolling list.
+const layoutSuggestionRows = (results, expanded, availableHeight) => {
+  if (expanded) {
+    return {
+      visible: results,
+      showSeeMore: false,
+      height: availableHeight == null ? null : Math.min(availableHeight, results.length * SUGGESTION_ROW_HEIGHT),
+      overflow: 'auto'
+    };
+  }
+
+  const desiredVisible = Math.min(SUGGESTION_VISIBLE_COUNT, results.length);
+  const wantsSeeMore = results.length > desiredVisible;
+
+  if (availableHeight == null) {
+    // No measurement yet — fall back to the simple cap; the caller applies
+    // DROPDOWN_FALLBACK_MAX_HEIGHT + overflow:auto as a safety net for this case.
+    return { visible: results.slice(0, desiredVisible), showSeeMore: wantsSeeMore, height: null, overflow: 'auto' };
+  }
+
+  const rowsThatFit = Math.max(0, Math.floor(availableHeight / SUGGESTION_ROW_HEIGHT));
+
+  if (!wantsSeeMore) {
+    const visibleCount = Math.min(desiredVisible, rowsThatFit);
+    return { visible: results.slice(0, visibleCount), showSeeMore: false, height: visibleCount * SUGGESTION_ROW_HEIGHT, overflow: 'hidden' };
+  }
+
+  // Reserve one row for "See more" whenever there's more to show, so the
+  // affordance to reach the rest is never crowded out by one extra result.
+  const roomForResults = Math.max(0, rowsThatFit - 1);
+  const visibleCount = Math.min(desiredVisible, roomForResults);
+  const showSeeMore = rowsThatFit >= 1 && results.length > visibleCount;
+  const rowCount = visibleCount + (showSeeMore ? 1 : 0);
+  return { visible: results.slice(0, visibleCount), showSeeMore, height: rowCount * SUGGESTION_ROW_HEIGHT, overflow: 'hidden' };
+};
+
+const SUGGESTION_ROW_STYLE = {
+  height: `${SUGGESTION_ROW_HEIGHT}px`,
+  padding: '0 8px',
+  boxSizing: 'border-box',
+  display: 'flex',
+  alignItems: 'center',
+  fontFamily: 'var(--font-display)',
+  color: 'var(--color-text-primary)',
+  fontSize: '13px',
+  cursor: 'pointer',
+  borderBottom: '1px solid var(--color-border)',
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis'
+};
+
+// Renders the autosuggest dropdown through a portal to document.body,
+// positioned with `position: fixed` from the input wrapper's live
+// getBoundingClientRect. This — not the dropdown's own max-height — is what
+// actually keeps it from being clipped by mt-route-card's max-height +
+// overflow-y:auto: a child positioned inside a scrolling ancestor is always
+// clipped at that ancestor's edge no matter how its own size is computed,
+// regardless of keyboard state. Escaping via portal + fixed positioning lays
+// it out against the true viewport instead, so it can no longer be clipped
+// by the card at all. Recomputes on visualViewport resize/scroll (keyboard
+// show/hide), window resize, and any ancestor scroll — 'scroll' events don't
+// bubble, so the ancestor-scroll listener is capture-phase on document.
+const SuggestionDropdown = ({ wrapperRef, isOpen, loading, results, expanded, onExpand, onSelect, formatItem, onPointerEnter, onPointerLeave }) => {
+  const [geometry, setGeometry] = useState(null);
 
   useEffect(() => {
     if (!isOpen) return undefined;
-    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
-    if (!vv) {
-      setMaxHeight(null);
-      return undefined;
-    }
     const recompute = () => {
       if (!wrapperRef.current) return;
-      const rect = wrapperRef.current.getBoundingClientRect();
-      const visibleBottom = vv.offsetTop + vv.height;
-      setMaxHeight(Math.max(0, visibleBottom - rect.bottom - DROPDOWN_BOTTOM_MARGIN));
+      const wrapperRect = wrapperRef.current.getBoundingClientRect();
+      const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+      const visibleBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+      setGeometry({
+        left: wrapperRect.left,
+        top: wrapperRect.bottom + 2,
+        width: wrapperRect.width,
+        availableHeight: Math.max(0, visibleBottom - (wrapperRect.bottom + 2) - DROPDOWN_BOTTOM_MARGIN)
+      });
     };
     recompute();
-    vv.addEventListener('resize', recompute);
-    vv.addEventListener('scroll', recompute);
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    vv?.addEventListener('resize', recompute);
+    vv?.addEventListener('scroll', recompute);
+    window.addEventListener('resize', recompute);
+    document.addEventListener('scroll', recompute, true);
     return () => {
-      vv.removeEventListener('resize', recompute);
-      vv.removeEventListener('scroll', recompute);
+      vv?.removeEventListener('resize', recompute);
+      vv?.removeEventListener('scroll', recompute);
+      window.removeEventListener('resize', recompute);
+      document.removeEventListener('scroll', recompute, true);
     };
   }, [isOpen, wrapperRef]);
 
-  return maxHeight;
+  if (!isOpen || typeof document === 'undefined') return null;
+
+  const layout = loading ? null : layoutSuggestionRows(results, expanded, geometry?.availableHeight ?? null);
+
+  const containerStyle = {
+    position: 'fixed',
+    left: geometry?.left ?? 0,
+    top: geometry?.top ?? 0,
+    width: geometry?.width ?? 'auto',
+    zIndex: 3100,
+    background: 'var(--color-panel)',
+    border: '1px solid var(--color-border)',
+    borderRadius: 'var(--radius-soft)',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+    visibility: geometry ? 'visible' : 'hidden',
+    boxSizing: 'border-box',
+    ...(loading
+      ? {}
+      : layout.height != null
+        ? { height: `${layout.height}px`, overflowY: layout.overflow }
+        : { maxHeight: DROPDOWN_FALLBACK_MAX_HEIGHT, overflowY: 'auto' })
+  };
+
+  return createPortal(
+    <div onMouseEnter={onPointerEnter} onMouseLeave={onPointerLeave} style={containerStyle}>
+      {loading ? (
+        <div style={{ ...SUGGESTION_ROW_STYLE, cursor: 'default', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
+      ) : (
+        <>
+          {layout.visible.map((item) => (
+            <div
+              key={item.id}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onSelect(item);
+              }}
+              style={SUGGESTION_ROW_STYLE}
+            >
+              {formatItem(item)}
+            </div>
+          ))}
+          {layout.showSeeMore && (
+            <div
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onExpand();
+              }}
+              style={{ ...SUGGESTION_ROW_STYLE, justifyContent: 'center', color: '#e85d04', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', fontSize: '12px', borderBottom: 'none' }}
+            >
+              See more ({results.length - layout.visible.length} more)
+            </div>
+          )}
+        </>
+      )}
+    </div>,
+    document.body
+  );
 };
 
 const SPEED_UNIT_OPTIONS = [
@@ -1674,12 +1809,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // A search query overrides both and filters by name across all routes.
   const startDropdownOpen = startSuggestLoading || startSuggestions.length > 0;
   const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
-  const startDropdownMaxHeight = useDropdownMaxHeight(startWrapperRef, startDropdownOpen);
-  const endDropdownMaxHeight = useDropdownMaxHeight(endWrapperRef, endDropdownOpen);
-  const startDropdownMaxHeightStyle = startDropdownMaxHeight != null ? `${startDropdownMaxHeight}px` : DROPDOWN_FALLBACK_MAX_HEIGHT;
-  const endDropdownMaxHeightStyle = endDropdownMaxHeight != null ? `${endDropdownMaxHeight}px` : DROPDOWN_FALLBACK_MAX_HEIGHT;
-  const visibleStartSuggestions = startSuggestionsExpanded ? startSuggestions : startSuggestions.slice(0, SUGGESTION_VISIBLE_COUNT);
-  const visibleEndSuggestions = endSuggestionsExpanded ? endSuggestions : endSuggestions.slice(0, SUGGESTION_VISIBLE_COUNT);
 
   const trimmedRouteSearch = routeSearchQuery.trim().toLowerCase();
   const displayedSavedRoutes = trimmedRouteSearch
@@ -1693,14 +1822,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       <style>{`
         @media (max-width: 480px) {
           .mt-route-card {
-            /* Corner-anchored + capped width (same technique as the
-               hamburger drawer) rather than stretched with left+right insets,
-               so it stays a compact floating card instead of spanning the
-               screen on wider phones. */
-            left: 12px !important;
-            top: 84px !important;
-            width: min(340px, calc(100vw - 24px)) !important;
-            max-height: calc(100vh - 100px) !important;
+            /* Corner-anchored at the same 16px margin as the hamburger
+               drawer (MenuDrawer.jsx), not a large fixed top offset — this
+               card and the hamburger button occupy the same row across the
+               top of the screen, so width is capped to leave the button's
+               56px + 16px margin + a 16px gap clear on the right rather than
+               reaching under it (16 possible px of card margin already
+               spoken for on the left, hence the 104px reservation: 56 + 16
+               + 16 + 16). max-height mirrors the drawer's own
+               calc(100vh - 32px) (16px margin top and bottom) now that top
+               starts at 16px instead of 84px. */
+            left: 16px !important;
+            top: 16px !important;
+            width: min(320px, calc(100vw - 104px)) !important;
+            max-height: calc(100vh - 32px) !important;
             overflow-y: auto !important;
           }
           .mt-route-card.mt-has-permits {
@@ -2258,56 +2393,18 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onChange={handleStartChange}
             style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
-          {startDropdownOpen && (
-            <div
-              onMouseEnter={() => { startInteractingRef.current = true; }}
-              onMouseLeave={() => { startInteractingRef.current = false; }}
-              style={{
-                position: 'absolute',
-                top: '100%',
-                left: 0,
-                right: 0,
-                zIndex: 2200,
-                background: 'var(--color-panel)',
-                border: '1px solid var(--color-border)',
-                borderRadius: 'var(--radius-soft)',
-                boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-                marginTop: '2px',
-                maxHeight: startDropdownMaxHeightStyle,
-                overflowY: 'auto'
-              }}
-            >
-              {startSuggestLoading ? (
-                <div style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
-              ) : (
-                <>
-                  {visibleStartSuggestions.map((item) => (
-                    <div
-                      key={item.id}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        selectStartSuggestion(item);
-                      }}
-                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
-                    >
-                      {formatSuggestion(item)}
-                    </div>
-                  ))}
-                  {!startSuggestionsExpanded && startSuggestions.length > SUGGESTION_VISIBLE_COUNT && (
-                    <div
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        setStartSuggestionsExpanded(true);
-                      }}
-                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', color: '#e85d04', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}
-                    >
-                      See more ({startSuggestions.length - SUGGESTION_VISIBLE_COUNT} more)
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+          <SuggestionDropdown
+            wrapperRef={startWrapperRef}
+            isOpen={startDropdownOpen}
+            loading={startSuggestLoading}
+            results={startSuggestions}
+            expanded={startSuggestionsExpanded}
+            onExpand={() => setStartSuggestionsExpanded(true)}
+            onSelect={selectStartSuggestion}
+            formatItem={formatSuggestion}
+            onPointerEnter={() => { startInteractingRef.current = true; }}
+            onPointerLeave={() => { startInteractingRef.current = false; }}
+          />
         </div>
         <div ref={endWrapperRef} style={{ position: 'relative', marginBottom: '8px' }}>
           <input
@@ -2317,56 +2414,18 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             onChange={handleEndChange}
             style={{ width: '100%', minHeight: '44px', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)', fontSize: '14px' }}
           />
-          {endDropdownOpen && (
-            <div
-              onMouseEnter={() => { endInteractingRef.current = true; }}
-              onMouseLeave={() => { endInteractingRef.current = false; }}
-              style={{
-                position: 'absolute',
-                top: '100%',
-                left: 0,
-                right: 0,
-                zIndex: 2200,
-                background: 'var(--color-panel)',
-                border: '1px solid var(--color-border)',
-                borderRadius: 'var(--radius-soft)',
-                boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-                marginTop: '2px',
-                maxHeight: endDropdownMaxHeightStyle,
-                overflowY: 'auto'
-              }}
-            >
-              {endSuggestLoading ? (
-                <div style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', fontSize: '12px', color: 'var(--color-text-muted)' }}>Searching…</div>
-              ) : (
-                <>
-                  {visibleEndSuggestions.map((item) => (
-                    <div
-                      key={item.id}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        selectEndSuggestion(item);
-                      }}
-                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', borderBottom: '1px solid var(--color-border)' }}
-                    >
-                      {formatSuggestion(item)}
-                    </div>
-                  ))}
-                  {!endSuggestionsExpanded && endSuggestions.length > SUGGESTION_VISIBLE_COUNT && (
-                    <div
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        setEndSuggestionsExpanded(true);
-                      }}
-                      style={{ padding: '8px', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', color: '#e85d04', fontSize: '12px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}
-                    >
-                      See more ({endSuggestions.length - SUGGESTION_VISIBLE_COUNT} more)
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+          <SuggestionDropdown
+            wrapperRef={endWrapperRef}
+            isOpen={endDropdownOpen}
+            loading={endSuggestLoading}
+            results={endSuggestions}
+            expanded={endSuggestionsExpanded}
+            onExpand={() => setEndSuggestionsExpanded(true)}
+            onSelect={selectEndSuggestion}
+            formatItem={formatSuggestion}
+            onPointerEnter={() => { endInteractingRef.current = true; }}
+            onPointerLeave={() => { endInteractingRef.current = false; }}
+          />
         </div>
         <button
           onClick={() => calculateRoute()}
