@@ -449,29 +449,55 @@ const useAvailableViewportHeight = (margin) => {
 // dependency list) so any change to their content — the saved-routes
 // dropdown opening, an error message appearing, the station-count warning
 // showing — automatically re-triggers the calculation.
-const useOptionsListHeight = (headerRef, footerRef, cardMaxHeight, itemCount, rowHeight) => {
+//
+// Critical: the ceiling this budgets against is read directly off the card
+// via getComputedStyle(cardRef.current).maxHeight, NOT re-derived from
+// `cardMaxHeightHint` (a raw VisualViewport number) the way an earlier
+// version of this hook did. That earlier version's own height - 32 estimate
+// didn't include env(safe-area-inset-bottom), which the CSS max-height
+// formula on .mt-route-card does — so on any device with a nonzero inset,
+// the JS estimate came out taller than the card's real enforced ceiling,
+// letting the options list claim more height than actually existed and
+// pushing the footer (Start Navigation included) past the card's clipped
+// edge — i.e. it disappeared entirely, not just scrolled out of reach.
+// Reading the browser's own already-resolved value instead of a second,
+// independently-computed one removes that whole class of divergence.
+// `cardMaxHeightHint` is still taken as a dependency purely so this re-runs
+// in step with the card's own VisualViewport-driven re-renders (React's
+// effect-ordering guarantees the DOM already reflects the new
+// --card-max-height by the time this layout effect's recompute runs); its
+// numeric value is never used directly. getComputedStyle returning 'none'
+// (outside the mobile breakpoint, e.g. desktop) means there's no CSS
+// ceiling to budget against, so the list is left uncapped.
+const useOptionsListHeight = (cardRef, headerRef, footerRef, cardMaxHeightHint, itemCount, rowHeight) => {
   const [height, setHeight] = useState(null);
 
   useLayoutEffect(() => {
-    if (!itemCount || cardMaxHeight == null) {
+    if (!itemCount) {
       setHeight(null);
       return undefined;
     }
     const recompute = () => {
-      if (!headerRef.current || !footerRef.current) return;
+      if (!cardRef.current || !headerRef.current || !footerRef.current) return;
+      const resolvedMaxHeight = parseFloat(getComputedStyle(cardRef.current).maxHeight);
+      if (!Number.isFinite(resolvedMaxHeight)) {
+        setHeight(null);
+        return;
+      }
       const headerH = headerRef.current.getBoundingClientRect().height;
       const footerH = footerRef.current.getBoundingClientRect().height;
-      const available = Math.max(0, cardMaxHeight - headerH - footerH - CARD_VERTICAL_PADDING);
+      const available = Math.max(0, resolvedMaxHeight - headerH - footerH - CARD_VERTICAL_PADDING);
       const desired = itemCount * rowHeight;
       const rowsThatFit = Math.floor(available / rowHeight);
       setHeight(Math.min(desired, Math.max(0, rowsThatFit) * rowHeight));
     };
     recompute();
     const ro = new ResizeObserver(recompute);
+    if (cardRef.current) ro.observe(cardRef.current);
     if (headerRef.current) ro.observe(headerRef.current);
     if (footerRef.current) ro.observe(footerRef.current);
     return () => ro.disconnect();
-  }, [itemCount, cardMaxHeight, rowHeight, headerRef, footerRef]);
+  }, [itemCount, cardMaxHeightHint, rowHeight, cardRef, headerRef, footerRef]);
 
   return height;
 };
@@ -669,6 +695,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const autoUnitIntervalRef = useRef(null);
   const wakeLockRef = useRef(null);
   const optionsMenuRef = useRef(null);
+  const routeCardRef = useRef(null);
   const routeCardHeaderRef = useRef(null);
   const routeCardFooterRef = useRef(null);
   const startWrapperRef = useRef(null);
@@ -1913,7 +1940,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
 
   const routeCardMaxHeight = useAvailableViewportHeight(CARD_MARGIN);
-  const routeOptionsListHeight = useOptionsListHeight(routeCardHeaderRef, routeCardFooterRef, routeCardMaxHeight, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
+  const routeOptionsListHeight = useOptionsListHeight(routeCardRef, routeCardHeaderRef, routeCardFooterRef, routeCardMaxHeight, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
   const permitPanelAvailableHeight = useAvailableViewportHeight(PERMIT_PANEL_MARGIN);
   const permitPanelMaxHeight = permitPanelAvailableHeight == null ? PERMIT_PANEL_MAX_HEIGHT : Math.min(PERMIT_PANEL_MAX_HEIGHT, permitPanelAvailableHeight);
 
@@ -2386,6 +2413,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       )}
       {!navigating && (
       <div
+        ref={routeCardRef}
         className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
         style={{
           position: 'absolute',
@@ -2627,7 +2655,47 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             ))}
           </div>
         )}
-        <div ref={routeCardFooterRef} style={{ flex: '0 0 auto' }}>
+        <div
+          ref={routeCardFooterRef}
+          style={{
+            flex: '0 0 auto',
+            // Visually separates the pinned action area from the scrollable
+            // options list above it, and clears the home-indicator/gesture
+            // area on notched phones — this is the last content in the
+            // card, so it's the one place that inset actually matters here.
+            borderTop: routeOptions.length > 0 ? '1px solid var(--color-border)' : 'none',
+            marginTop: routeOptions.length > 0 ? '10px' : 0,
+            paddingTop: routeOptions.length > 0 ? '10px' : 0,
+            paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+          }}
+        >
+        {routeOptions.length > 0 && (
+          <button
+            onClick={startNavigation}
+            style={{
+              width: '100%',
+              minHeight: '52px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '14px',
+              background: 'var(--color-route-normal)',
+              color: 'white',
+              border: 'none',
+              borderRadius: 0,
+              cursor: 'pointer',
+              fontFamily: 'var(--font-display)',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              fontWeight: 700,
+              fontSize: '15px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.25)'
+            }}
+          >
+            Start Navigation
+          </button>
+        )}
         {routeOptions.length > 0 && (
           <button
             onClick={() => { setSaveRouteName(''); setSaveRouteError(''); setShowSaveRouteModal(true); }}
@@ -2638,46 +2706,21 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              marginTop: '10px',
-              padding: '10px',
-              background: 'var(--color-panel)',
-              color: '#e85d04',
-              border: '1px solid #e85d04',
-              borderRadius: 0,
-              cursor: 'pointer',
-              fontFamily: 'var(--font-display)',
-              textTransform: 'uppercase',
-              letterSpacing: '0.05em',
-              fontWeight: 700
-            }}
-          >
-            Save This Route
-          </button>
-        )}
-        {routeOptions.length > 0 && (
-          <button
-            onClick={startNavigation}
-            style={{
-              width: '100%',
-              minHeight: '44px',
-              boxSizing: 'border-box',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              marginTop: '10px',
-              padding: '10px',
-              background: 'var(--color-route-normal)',
-              color: 'white',
+              marginTop: '8px',
+              padding: '8px',
+              background: 'transparent',
+              color: 'var(--color-text-muted)',
               border: 'none',
               borderRadius: 0,
               cursor: 'pointer',
               fontFamily: 'var(--font-display)',
               textTransform: 'uppercase',
               letterSpacing: '0.05em',
-              fontWeight: 700
+              fontWeight: 600,
+              fontSize: '12px'
             }}
           >
-            Start Navigation
+            Save This Route
           </button>
         )}
         {routeOptions.length > 0 && inspectionStationCount > 0 && (
