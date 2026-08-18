@@ -445,31 +445,29 @@ const useAvailableViewportHeight = (margin) => {
 // so it can never show a fraction of a row at rest — the same guarantee
 // layoutSuggestionRows makes for the autosuggest dropdown, adapted for a
 // small (max 3-item) list that just needs to scroll rather than paginate.
-// header/footer are measured via ResizeObserver (not a hand-maintained
-// dependency list) so any change to their content — the saved-routes
-// dropdown opening, an error message appearing, the station-count warning
-// showing — automatically re-triggers the calculation.
 //
-// Critical: the ceiling this budgets against is read directly off the card
-// via getComputedStyle(cardRef.current).maxHeight, NOT re-derived from
-// `cardMaxHeightHint` (a raw VisualViewport number) the way an earlier
-// version of this hook did. That earlier version's own height - 32 estimate
-// didn't include env(safe-area-inset-bottom), which the CSS max-height
-// formula on .mt-route-card does — so on any device with a nonzero inset,
-// the JS estimate came out taller than the card's real enforced ceiling,
-// letting the options list claim more height than actually existed and
-// pushing the footer (Start Navigation included) past the card's clipped
-// edge — i.e. it disappeared entirely, not just scrolled out of reach.
-// Reading the browser's own already-resolved value instead of a second,
-// independently-computed one removes that whole class of divergence.
-// `cardMaxHeightHint` is still taken as a dependency purely so this re-runs
-// in step with the card's own VisualViewport-driven re-renders (React's
-// effect-ordering guarantees the DOM already reflects the new
-// --card-max-height by the time this layout effect's recompute runs); its
-// numeric value is never used directly. getComputedStyle returning 'none'
-// (outside the mobile breakpoint, e.g. desktop) means there's no CSS
-// ceiling to budget against, so the list is left uncapped.
-const useOptionsListHeight = (cardRef, headerRef, footerRef, cardMaxHeightHint, itemCount, rowHeight) => {
+// This is the third version of this calculation. The first computed
+// "available space" from a hand-rolled VisualViewport estimate of the
+// card's max-height, which didn't match the CSS formula's own
+// env(safe-area-inset-bottom) term on devices with a nonzero inset. The
+// second switched to getComputedStyle(card).maxHeight to remove that
+// divergence, but still subtracted a hand-maintained CARD_VERTICAL_PADDING
+// constant from it — silently wrong on this app's default box-sizing
+// (content-box, no global border-box reset), where max-height already
+// excludes padding, so that subtraction double-counted it and the list
+// could come out too short, hiding real estate the layout actually had.
+// Both bugs share a root cause: re-deriving in JS a number the browser's
+// own layout engine already computes correctly.
+//
+// This version doesn't re-derive anything. `el.style.height` is cleared
+// immediately before measuring, letting flexbox's own shrink-to-fit
+// determine the list's natural allocated size — respecting the card's
+// real max-height, real box-sizing, real header/footer sizes, all handled
+// natively — then that measurement is rounded down to a whole number of
+// rows. The clear-then-read happens synchronously within one recompute
+// call (a deliberate, one-shot forced-reflow read, not a loop), so the
+// element is never visibly rendered at its unrounded natural size.
+const useOptionsListHeight = (listRef, cardRef, headerRef, footerRef, itemCount, rowHeight) => {
   const [height, setHeight] = useState(null);
 
   useLayoutEffect(() => {
@@ -478,33 +476,41 @@ const useOptionsListHeight = (cardRef, headerRef, footerRef, cardMaxHeightHint, 
       return undefined;
     }
     const recompute = () => {
-      if (!cardRef.current || !headerRef.current || !footerRef.current) return;
-      const resolvedMaxHeight = parseFloat(getComputedStyle(cardRef.current).maxHeight);
-      if (!Number.isFinite(resolvedMaxHeight)) {
-        setHeight(null);
-        return;
-      }
-      const headerH = headerRef.current.getBoundingClientRect().height;
-      const footerH = footerRef.current.getBoundingClientRect().height;
-      const available = Math.max(0, resolvedMaxHeight - headerH - footerH - CARD_VERTICAL_PADDING);
+      const el = listRef.current;
+      if (!el || !cardRef.current || !headerRef.current || !footerRef.current) return;
+      const prevHeight = el.style.height;
+      el.style.height = '';
+      const naturalHeight = el.getBoundingClientRect().height;
+      el.style.height = prevHeight;
+      const rowsThatFit = Math.floor(naturalHeight / rowHeight);
       const desired = itemCount * rowHeight;
-      const rowsThatFit = Math.floor(available / rowHeight);
       setHeight(Math.min(desired, Math.max(0, rowsThatFit) * rowHeight));
     };
     recompute();
+    // Observes the card/header/footer (siblings whose size changes affect
+    // how much flex space the list naturally gets) rather than the list
+    // itself, which would self-trigger against the explicit height this
+    // sets on every recompute.
     const ro = new ResizeObserver(recompute);
     if (cardRef.current) ro.observe(cardRef.current);
     if (headerRef.current) ro.observe(headerRef.current);
     if (footerRef.current) ro.observe(footerRef.current);
-    return () => ro.disconnect();
-  }, [itemCount, cardMaxHeightHint, rowHeight, cardRef, headerRef, footerRef]);
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    vv?.addEventListener('resize', recompute);
+    vv?.addEventListener('scroll', recompute);
+    window.addEventListener('resize', recompute);
+    return () => {
+      ro.disconnect();
+      vv?.removeEventListener('resize', recompute);
+      vv?.removeEventListener('scroll', recompute);
+      window.removeEventListener('resize', recompute);
+    };
+  }, [itemCount, rowHeight, listRef, cardRef, headerRef, footerRef]);
 
   return height;
 };
 
 const CARD_MARGIN = 16;
-// PANEL_STYLE-driven padding on .mt-route-card (16px top + 16px bottom).
-const CARD_VERTICAL_PADDING = 32;
 const ROUTE_OPTION_ROW_HEIGHT = 56;
 const PERMIT_PANEL_MARGIN = 20;
 const PERMIT_PANEL_MAX_HEIGHT = 230;
@@ -698,6 +704,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const routeCardRef = useRef(null);
   const routeCardHeaderRef = useRef(null);
   const routeCardFooterRef = useRef(null);
+  const routeOptionsListRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -1940,7 +1947,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
 
   const routeCardMaxHeight = useAvailableViewportHeight(CARD_MARGIN);
-  const routeOptionsListHeight = useOptionsListHeight(routeCardRef, routeCardHeaderRef, routeCardFooterRef, routeCardMaxHeight, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
+  const routeOptionsListHeight = useOptionsListHeight(routeOptionsListRef, routeCardRef, routeCardHeaderRef, routeCardFooterRef, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
   const permitPanelAvailableHeight = useAvailableViewportHeight(PERMIT_PANEL_MARGIN);
   const permitPanelMaxHeight = permitPanelAvailableHeight == null ? PERMIT_PANEL_MAX_HEIGHT : Math.min(PERMIT_PANEL_MAX_HEIGHT, permitPanelAvailableHeight);
 
@@ -2615,9 +2622,21 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         </div>
         {routeOptions.length > 0 && (
           <div
+            ref={routeOptionsListRef}
             style={{
-              flex: '0 0 auto',
-              height: routeOptionsListHeight != null ? `${routeOptionsListHeight}px` : `${routeOptions.length * ROUTE_OPTION_ROW_HEIGHT}px`,
+              // flex-shrink (not flex-grow) lets the browser's own layout
+              // engine give this its full natural desired size (maxHeight,
+              // itemCount*ROW_HEIGHT — already a whole number of rows) when
+              // there's room, or shrink it when the card doesn't have that
+              // much to spare — correctly, natively, regardless of
+              // box-sizing or safe-area insets. The explicit `height`, once
+              // useOptionsListHeight has measured that natural/shrunk
+              // result, rounds it down to a whole row so nothing sits at a
+              // fractional row height at rest; overflow-y still scrolls to
+              // reach whatever got trimmed.
+              flex: '0 1 auto',
+              maxHeight: `${routeOptions.length * ROUTE_OPTION_ROW_HEIGHT}px`,
+              height: routeOptionsListHeight != null ? `${routeOptionsListHeight}px` : undefined,
               minHeight: 0,
               overflowY: 'auto',
               marginTop: '10px',
