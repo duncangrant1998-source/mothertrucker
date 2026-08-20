@@ -12,6 +12,12 @@ const ROUTE_CONFIGS = [
   { id: 'shortest', label: 'Shortest', routingMode: 'short', avoidTolls: false }
 ];
 
+// Which option is pre-selected when results land. Selected by id rather than
+// by array position, since any individual config can fail routing and get
+// filtered out — "index 0" could silently mean No Tolls on a trip where the
+// Fastest request failed, quietly changing which route the driver starts on.
+const DEFAULT_ROUTE_ID = 'fastest';
+
 // HERE's canvas-rendered polylines can't consume CSS custom properties, so the
 // route-normal token is duplicated here (day/night) and picked via the same
 // mechanism tokens.css responds to: a manual data-theme override on <html>
@@ -1431,10 +1437,15 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         console.warn(`[routing] ${options.length - uniquePolylines.size} of ${options.length} route option(s) returned the exact same polyline as another option — HERE genuinely returned identical routes for those configs, not just coincidentally-equal stats.`);
       }
 
-      options.forEach((opt, index) => {
-        opt.polyline.setStyle(index === 0 ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
+      const defaultOption = options.find((opt) => opt.id === DEFAULT_ROUTE_ID) || options[0];
+      options.forEach((opt) => {
+        opt.polyline.setStyle(opt.id === defaultOption.id ? selectedRouteStyle() : UNSELECTED_ROUTE_STYLE);
       });
-      const orderedPolylines = [...options.slice(1).map((opt) => opt.polyline), options[0].polyline];
+      // Selected route's polyline goes last so it draws on top of the others.
+      const orderedPolylines = [
+        ...options.filter((opt) => opt.id !== defaultOption.id).map((opt) => opt.polyline),
+        defaultOption.polyline
+      ];
       const startMarker = new H.map.Marker({ lat: start.lat, lng: start.lng });
       const endMarker = new H.map.Marker({ lat: end.lat, lng: end.lng });
       mapInstance.current.addObjects([...orderedPolylines, startMarker, endMarker]);
@@ -1453,9 +1464,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       routeStartRef.current = { lat: start.lat, lng: start.lng };
       routeEndRef.current = { lat: end.lat, lng: end.lng };
       setRouteOptions(options);
-      setSelectedRouteId(options[0].id);
+      setSelectedRouteId(defaultOption.id);
       setProvincesOnRoute(getProvincesForBounds(combinedBounds));
-      updateStationsForRoute(options[0].bounds);
+      updateStationsForRoute(defaultOption.bounds);
       setSearching(false);
     } catch (err) {
       setError(err.message);
@@ -2623,6 +2634,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         {routeOptions.length > 0 && (
           <div
             ref={routeOptionsListRef}
+            role="radiogroup"
+            aria-label="Route options"
             style={{
               // flex-shrink (not flex-grow) lets the browser's own layout
               // engine give this its full natural desired size (maxHeight,
@@ -2645,33 +2658,93 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               gap: '8px'
             }}
           >
-            {routeOptions.map((opt) => (
+            {routeOptions.map((opt) => {
+              const isSelected = opt.id === selectedRouteId;
+              return (
               <button
                 key={opt.id}
                 onClick={() => selectRoute(opt.id)}
+                role="radio"
+                aria-checked={isSelected}
                 style={{
                   textAlign: 'left',
                   height: `${ROUTE_OPTION_ROW_HEIGHT}px`,
                   flex: '0 0 auto',
                   boxSizing: 'border-box',
-                  padding: '10px 12px',
+                  padding: '8px 12px',
                   borderRadius: 0,
                   border: '1px solid var(--color-border)',
-                  borderLeft: opt.id === selectedRouteId ? '3px solid var(--color-route-normal)' : '1px solid var(--color-border)',
-                  background: 'var(--color-panel)',
+                  // 4px on BOTH states (transparent when unselected) rather
+                  // than 3px-vs-1px, so switching selection can't shift the
+                  // row's text sideways — and so the accent reads as a real
+                  // state change instead of a 2px difference nobody notices.
+                  borderLeft: `4px solid ${isSelected ? 'var(--color-route-normal)' : 'transparent'}`,
+                  background: isSelected
+                    ? 'color-mix(in srgb, var(--color-route-normal) 18%, var(--color-panel))'
+                    : 'var(--color-panel)',
                   cursor: 'pointer',
-                  fontFamily: 'var(--font-display)'
+                  fontFamily: 'var(--font-display)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px'
                 }}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', whiteSpace: 'nowrap', overflow: 'hidden' }}>
-                  <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{opt.label}</span>
-                  <span style={{ fontSize: '15px', flexShrink: 0 }}>{opt.hasTolls ? '🏷️' : '✅'}</span>
-                </div>
-                <div style={{ ...MONO_STYLE, fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {opt.km} km · {opt.durationText}
-                </div>
+                {/* The actual selection indicator. Previously the only
+                    selected/unselected difference was the left border above,
+                    while this slot held a toll icon (✅ for toll-free) that
+                    read as a checked checkbox — so a trip where every option
+                    was toll-free showed three green checkmarks at once. */}
+                <span
+                  aria-hidden="true"
+                  style={{
+                    flexShrink: 0,
+                    width: '20px',
+                    height: '20px',
+                    borderRadius: '50%',
+                    boxSizing: 'border-box',
+                    border: isSelected ? 'none' : '2px solid var(--color-text-muted)',
+                    background: isSelected ? 'var(--color-route-normal)' : 'transparent',
+                    color: 'white',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    lineHeight: 1
+                  }}
+                >
+                  {isSelected ? '✓' : ''}
+                </span>
+                <span style={{ flex: 1, minWidth: 0, display: 'block' }}>
+                  <span style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '8px' }}>
+                    <span style={{
+                      fontWeight: isSelected ? 700 : 600,
+                      fontSize: '13px',
+                      color: isSelected ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis'
+                    }}>
+                      {opt.label}
+                    </span>
+                    {/* Toll status as explicit words — it's route metadata,
+                        not a selection state, so it must not look like one. */}
+                    <span style={{
+                      ...LABEL_STYLE,
+                      fontSize: '9px',
+                      flexShrink: 0,
+                      color: opt.hasTolls ? 'var(--color-route-alert)' : 'var(--color-text-muted)'
+                    }}>
+                      {opt.hasTolls ? 'Toll' : 'No toll'}
+                    </span>
+                  </span>
+                  <span style={{ ...MONO_STYLE, display: 'block', fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {opt.km} km · {opt.durationText}
+                  </span>
+                </span>
               </button>
-            ))}
+              );
+            })}
           </div>
         )}
         <div
