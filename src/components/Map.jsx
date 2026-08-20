@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { supabase } from '../lib/supabase';
 import { getStationsNearRoute } from '../lib/inspectionStations';
@@ -447,75 +447,19 @@ const useAvailableViewportHeight = (margin) => {
   return height;
 };
 
-// Caps the route-options list to an exact multiple of ROUTE_OPTION_ROW_HEIGHT
-// so it can never show a fraction of a row at rest — the same guarantee
-// layoutSuggestionRows makes for the autosuggest dropdown, adapted for a
-// small (max 3-item) list that just needs to scroll rather than paginate.
+// There is deliberately no JS height calculation for the route-options
+// list any more. Three successive versions of one tried to compute how
+// much room the list could have — each got a different detail wrong
+// (a safe-area term missing from a hand-rolled viewport estimate; a
+// padding subtraction that double-counted under content-box; and finally
+// a correct-in-isolation flex measurement that still collapsed the list
+// to 0px the moment the card's max-height dropped, because the list was
+// the only flexible region and absorbed the entire shortfall).
 //
-// This is the third version of this calculation. The first computed
-// "available space" from a hand-rolled VisualViewport estimate of the
-// card's max-height, which didn't match the CSS formula's own
-// env(safe-area-inset-bottom) term on devices with a nonzero inset. The
-// second switched to getComputedStyle(card).maxHeight to remove that
-// divergence, but still subtracted a hand-maintained CARD_VERTICAL_PADDING
-// constant from it — silently wrong on this app's default box-sizing
-// (content-box, no global border-box reset), where max-height already
-// excludes padding, so that subtraction double-counted it and the list
-// could come out too short, hiding real estate the layout actually had.
-// Both bugs share a root cause: re-deriving in JS a number the browser's
-// own layout engine already computes correctly.
-//
-// This version doesn't re-derive anything. `el.style.height` is cleared
-// immediately before measuring, letting flexbox's own shrink-to-fit
-// determine the list's natural allocated size — respecting the card's
-// real max-height, real box-sizing, real header/footer sizes, all handled
-// natively — then that measurement is rounded down to a whole number of
-// rows. The clear-then-read happens synchronously within one recompute
-// call (a deliberate, one-shot forced-reflow read, not a loop), so the
-// element is never visibly rendered at its unrounded natural size.
-const useOptionsListHeight = (listRef, cardRef, headerRef, footerRef, itemCount, rowHeight) => {
-  const [height, setHeight] = useState(null);
-
-  useLayoutEffect(() => {
-    if (!itemCount) {
-      setHeight(null);
-      return undefined;
-    }
-    const recompute = () => {
-      const el = listRef.current;
-      if (!el || !cardRef.current || !headerRef.current || !footerRef.current) return;
-      const prevHeight = el.style.height;
-      el.style.height = '';
-      const naturalHeight = el.getBoundingClientRect().height;
-      el.style.height = prevHeight;
-      const rowsThatFit = Math.floor(naturalHeight / rowHeight);
-      const desired = itemCount * rowHeight;
-      setHeight(Math.min(desired, Math.max(0, rowsThatFit) * rowHeight));
-    };
-    recompute();
-    // Observes the card/header/footer (siblings whose size changes affect
-    // how much flex space the list naturally gets) rather than the list
-    // itself, which would self-trigger against the explicit height this
-    // sets on every recompute.
-    const ro = new ResizeObserver(recompute);
-    if (cardRef.current) ro.observe(cardRef.current);
-    if (headerRef.current) ro.observe(headerRef.current);
-    if (footerRef.current) ro.observe(footerRef.current);
-    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
-    vv?.addEventListener('resize', recompute);
-    vv?.addEventListener('scroll', recompute);
-    window.addEventListener('resize', recompute);
-    return () => {
-      ro.disconnect();
-      vv?.removeEventListener('resize', recompute);
-      vv?.removeEventListener('scroll', recompute);
-      window.removeEventListener('resize', recompute);
-    };
-  }, [itemCount, rowHeight, listRef, cardRef, headerRef, footerRef]);
-
-  return height;
-};
-
+// The card now uses plain CSS instead: a scrollable body region and a
+// pinned action area, both sized natively by flexbox. The options list
+// keeps its natural height inside the scrollable body, so it can never
+// be squeezed to nothing regardless of how tight the card gets.
 const CARD_MARGIN = 16;
 const ROUTE_OPTION_ROW_HEIGHT = 56;
 const PERMIT_PANEL_MARGIN = 20;
@@ -707,10 +651,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const autoUnitIntervalRef = useRef(null);
   const wakeLockRef = useRef(null);
   const optionsMenuRef = useRef(null);
-  const routeCardRef = useRef(null);
-  const routeCardHeaderRef = useRef(null);
-  const routeCardFooterRef = useRef(null);
-  const routeOptionsListRef = useRef(null);
   const startWrapperRef = useRef(null);
   const endWrapperRef = useRef(null);
   const startSuggestTimeout = useRef(null);
@@ -1293,6 +1233,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const selected = routeOptions.find((opt) => opt.id === routeId);
     if (!selected) return;
 
+    console.log('[route-options] SELECTION CHANGED (selectRoute — user tap)', {
+      from: selectedRouteId,
+      to: routeId,
+      length: routeOptions.length,
+      note: 'array is not modified here — only the selected id changes'
+    });
     setSelectedRouteId(routeId);
 
     routeOptions.forEach((opt) => {
@@ -1342,6 +1288,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     if (overrideEnd) setEndLocation(endText);
     setSearching(true);
     setError('');
+    console.log('[route-options] CLEARED (calculateRoute start — new search beginning)', { length: 0, selectedRouteId: null });
     setRouteOptions([]);
     setSelectedRouteId(null);
     setProvincesOnRoute([]);
@@ -1463,9 +1410,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
       routeStartRef.current = { lat: start.lat, lng: start.lng };
       routeEndRef.current = { lat: end.lat, lng: end.lng };
+      const provinces = getProvincesForBounds(combinedBounds);
+      console.log('[route-options] POPULATED (calculateRoute success)', {
+        length: options.length,
+        ids: options.map((o) => o.id),
+        selectedRouteId: defaultOption.id,
+        // Non-empty provinces adds the .mt-has-permits class to the route
+        // card, which drops its CSS max-height by ~322px in the same commit
+        // — see the list-height recompute log immediately after this one.
+        provincesOnRoute: provinces
+      });
       setRouteOptions(options);
       setSelectedRouteId(defaultOption.id);
-      setProvincesOnRoute(getProvincesForBounds(combinedBounds));
+      setProvincesOnRoute(provinces);
       updateStationsForRoute(defaultOption.bounds);
       setSearching(false);
     } catch (err) {
@@ -1958,7 +1915,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const endDropdownOpen = endSuggestLoading || endSuggestions.length > 0;
 
   const routeCardMaxHeight = useAvailableViewportHeight(CARD_MARGIN);
-  const routeOptionsListHeight = useOptionsListHeight(routeOptionsListRef, routeCardRef, routeCardHeaderRef, routeCardFooterRef, routeOptions.length, ROUTE_OPTION_ROW_HEIGHT);
   const permitPanelAvailableHeight = useAvailableViewportHeight(PERMIT_PANEL_MARGIN);
   const permitPanelMaxHeight = permitPanelAvailableHeight == null ? PERMIT_PANEL_MAX_HEIGHT : Math.min(PERMIT_PANEL_MAX_HEIGHT, permitPanelAvailableHeight);
 
@@ -2003,9 +1959,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             overflow: hidden !important;
           }
           .mt-route-card.mt-has-permits {
-            /* Leaves room below for the bottom-anchored permit strip
-               (230px reserved height + gaps) so the two never overlap. */
-            max-height: min(max(160px, calc(100vh - 354px - env(safe-area-inset-bottom, 0px))), var(--card-max-height, 100vh)) !important;
+            /* Leaves room below for the bottom-anchored permit strip so the
+               two never overlap. The strip occupies at most its own 230px
+               plus its 20px bottom offset and the safe-area inset; the card
+               starts 16px from the top and keeps a 12px gap above the strip
+               — 278px total, not the 354px this previously reserved. That
+               over-reservation cost the card 76px it did not need to give
+               up, which is what tipped the options list into collapsing.
+               The floor is high enough to still fit the pinned action area
+               plus a scrollable row, rather than the old 160px which could
+               not. */
+            max-height: min(max(280px, calc(100vh - 278px - env(safe-area-inset-bottom, 0px))), var(--card-max-height, 100vh)) !important;
           }
           .mt-permit-panel {
             left: 12px !important;
@@ -2431,7 +2395,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       )}
       {!navigating && (
       <div
-        ref={routeCardRef}
         className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
         style={{
           position: 'absolute',
@@ -2443,22 +2406,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           padding: '16px',
           boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
           width: '280px',
-          // Flex column so the header and footer (route search fields /
-          // Save+Start buttons) take their natural size while the route-
-          // options list in between is the one flexible, scrollable region —
-          // same "fixed chrome, scrollable content, nothing ever half-
-          // rendered" shape as the autosuggest dropdown fix. The mobile
-          // media query below reads --card-max-height (this component's own
-          // VisualViewport-aware measurement) to bound the whole card to
-          // what's actually visible, combined via CSS min() with a
-          // safe-area-aware calc() fallback for browsers where the JS
-          // measurement hasn't landed yet.
+          // Two regions: a scrollable body (everything informational) and a
+          // pinned action area below it. The body is the ONLY flexible
+          // region and it shrinks by scrolling, never by hiding content —
+          // so no matter how tight the card gets, the route options keep
+          // their natural height and stay reachable, and the actions stay
+          // put. The mobile media query below bounds the whole card via
+          // --card-max-height (VisualViewport-aware, so the keyboard is
+          // accounted for) min()'d with a safe-area-aware CSS fallback.
           display: 'flex',
           flexDirection: 'column',
           '--card-max-height': routeCardMaxHeight != null ? `${routeCardMaxHeight}px` : undefined
         }}
       >
-        <div ref={routeCardHeaderRef} style={{ flex: '0 0 auto' }}>
+        <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>
         <div ref={routeDropdownRef} style={{ position: 'relative', marginBottom: '10px' }}>
           <button
             onClick={() => setShowRouteDropdown((open) => !open)}
@@ -2630,28 +2591,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         >
           {searching ? 'Calculating…' : 'Find Truck Route'}
         </button>
-        </div>
         {routeOptions.length > 0 && (
           <div
-            ref={routeOptionsListRef}
             role="radiogroup"
             aria-label="Route options"
             style={{
-              // flex-shrink (not flex-grow) lets the browser's own layout
-              // engine give this its full natural desired size (maxHeight,
-              // itemCount*ROW_HEIGHT — already a whole number of rows) when
-              // there's room, or shrink it when the card doesn't have that
-              // much to spare — correctly, natively, regardless of
-              // box-sizing or safe-area insets. The explicit `height`, once
-              // useOptionsListHeight has measured that natural/shrunk
-              // result, rounds it down to a whole row so nothing sits at a
-              // fractional row height at rest; overflow-y still scrolls to
-              // reach whatever got trimmed.
-              flex: '0 1 auto',
-              maxHeight: `${routeOptions.length * ROUTE_OPTION_ROW_HEIGHT}px`,
-              height: routeOptionsListHeight != null ? `${routeOptionsListHeight}px` : undefined,
-              minHeight: 0,
-              overflowY: 'auto',
+              // Natural height only — every option always renders at its
+              // full ROUTE_OPTION_ROW_HEIGHT. This list deliberately has no
+              // max-height, no flex-shrink and no measured height: the
+              // scrollable body above absorbs any space shortfall by
+              // scrolling, so the list can never be compressed to hide rows.
+              flexShrink: 0,
               marginTop: '10px',
               display: 'flex',
               flexDirection: 'column',
@@ -2747,14 +2697,34 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             })}
           </div>
         )}
+        {routeOptions.length > 0 && inspectionStationCount > 0 && (
+          <div
+            style={{
+              marginTop: '8px',
+              padding: '8px',
+              background: '#fef3c7',
+              border: '1px solid #f59e0b',
+              borderRadius: 'var(--radius-soft)',
+              color: '#92400e',
+              fontFamily: 'var(--font-display)',
+              fontSize: '13px',
+              fontWeight: 700
+            }}
+          >
+            ⚠️ {inspectionStationCount} MTO inspection station{inspectionStationCount === 1 ? '' : 's'} on this route — stay alert for flashing signs
+          </div>
+        )}
+        {error && (
+          <div style={{ marginTop: '8px', fontFamily: 'var(--font-display)', color: '#c0392b' }}>{error}</div>
+        )}
+        </div>
         <div
-          ref={routeCardFooterRef}
           style={{
+            // Pinned action area — never shrinks, never scrolls, so the
+            // primary action can't be pushed out of view no matter how
+            // little room the card has. paddingBottom clears the
+            // home-indicator/gesture area on notched phones.
             flex: '0 0 auto',
-            // Visually separates the pinned action area from the scrollable
-            // options list above it, and clears the home-indicator/gesture
-            // area on notched phones — this is the last content in the
-            // card, so it's the one place that inset actually matters here.
             borderTop: routeOptions.length > 0 ? '1px solid var(--color-border)' : 'none',
             marginTop: routeOptions.length > 0 ? '10px' : 0,
             paddingTop: routeOptions.length > 0 ? '10px' : 0,
@@ -2814,26 +2784,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           >
             Save This Route
           </button>
-        )}
-        {routeOptions.length > 0 && inspectionStationCount > 0 && (
-          <div
-            style={{
-              marginTop: '8px',
-              padding: '8px',
-              background: '#fef3c7',
-              border: '1px solid #f59e0b',
-              borderRadius: 'var(--radius-soft)',
-              color: '#92400e',
-              fontFamily: 'var(--font-display)',
-              fontSize: '13px',
-              fontWeight: 700
-            }}
-          >
-            ⚠️ {inspectionStationCount} MTO inspection station{inspectionStationCount === 1 ? '' : 's'} on this route — stay alert for flashing signs
-          </div>
-        )}
-        {error && (
-          <div style={{ marginTop: '8px', fontFamily: 'var(--font-display)', color: '#c0392b' }}>{error}</div>
         )}
         </div>
       </div>
