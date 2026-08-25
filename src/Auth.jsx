@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { supabase } from './lib/supabase';
 import highwayDusk from './assets/highway-dusk.svg';
+import PasswordRequirements from './components/PasswordRequirements';
 
 const Auth = ({ onAuthChange }) => {
   const [email, setEmail] = useState('');
@@ -130,6 +131,10 @@ const Auth = ({ onAuthChange }) => {
           background: '#FFFFFF'
         }}
       />
+
+      {/* Signup only: on the login form these rules are noise, and an existing
+          account may predate them. */}
+      {isSignUp && <PasswordRequirements password={password} />}
 
       {!isSignUp && (
         <div style={{ textAlign: 'right', marginBottom: '10px' }}>

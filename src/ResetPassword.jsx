@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { supabase } from './lib/supabase';
+import PasswordRequirements from './components/PasswordRequirements';
+import { PASSWORD_MIN_LENGTH } from './lib/passwordRules';
 
 const ResetPassword = ({ onDone }) => {
   const [password, setPassword] = useState('');
@@ -8,8 +10,13 @@ const ResetPassword = ({ onDone }) => {
   const [error, setError] = useState('');
 
   const handleUpdatePassword = async () => {
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters');
+    // Was hardcoded to 6, which went stale the moment the project's minimum
+    // moved to 12 — it accepted a password that Supabase then rejected. Reads
+    // the shared constant so the two can't drift again. The character-class
+    // rules stay advisory (see passwordRules.js) and are shown in the list
+    // below rather than gating here.
+    if (password.length < PASSWORD_MIN_LENGTH) {
+      setError(`Password must be at least ${PASSWORD_MIN_LENGTH} characters`);
       return;
     }
     if (password !== confirmPassword) {
@@ -64,6 +71,8 @@ const ResetPassword = ({ onDone }) => {
           background: '#FFFFFF'
         }}
       />
+
+      <PasswordRequirements password={password} />
 
       <input
         type="password"
