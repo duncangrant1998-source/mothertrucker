@@ -108,8 +108,14 @@ function App() {
           .from('vehicle_profiles')
           .select('*')
           .eq('user_id', user.id)
-          .single();
-        if (!cancelled && !error && data) setProfile(data);
+          .maybeSingle();
+        // Rethrow rather than swallowing via `!error &&`: a real load failure
+        // used to leave `profile` null with nothing logged anywhere, so the
+        // app silently routed on Map.jsx's generic defaults instead of the
+        // driver's actual truck. Now it at least reaches the console, and
+        // therefore Sentry's breadcrumbs.
+        if (error) throw error;
+        if (!cancelled && data) setProfile(data);
       } catch (err) {
         console.error('Failed to load vehicle profile:', err);
       }

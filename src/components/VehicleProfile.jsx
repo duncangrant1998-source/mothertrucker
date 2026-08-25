@@ -1,6 +1,13 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { fetchOntarioInspectionStations } from '../lib/inspectionStations';
+import {
+  DIMENSION_FIELDS,
+  NUMERIC_FIELDS,
+  toNumericOrNull,
+  toFieldValue,
+  findMissingDimensions
+} from '../lib/vehicleProfile';
 
 const LABEL_STYLE = {
   fontFamily: 'var(--font-display)',
@@ -37,6 +44,10 @@ const VehicleProfile = ({ onProfileUpdate }) => {
   });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+  // Tone is tracked explicitly rather than sniffed from the message text — the
+  // old `message.includes('Error')` check rendered 'Please log in first' green.
+  const [messageTone, setMessageTone] = useState('success');
+  const [invalidFields, setInvalidFields] = useState([]);
   const [syncingStations, setSyncingStations] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
@@ -48,44 +59,98 @@ const VehicleProfile = ({ onProfileUpdate }) => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const { data } = await supabase
+      // maybeSingle, not single: having no profile yet is a normal state for a
+      // new driver, but .single() reports it as an error — which made a genuine
+      // failure (duplicate rows, network) look identical to "nothing saved yet"
+      // and hid the duplicate-row bug for as long as it did.
+      const { data, error } = await supabase
         .from('vehicle_profiles')
         .select('*')
         .eq('user_id', user.id)
-        .single();
-      if (data) setProfile(data);
+        .maybeSingle();
+      if (error) throw error;
+      if (data) {
+        setProfile({
+          ...data,
+          ...Object.fromEntries(NUMERIC_FIELDS.map((f) => [f, toFieldValue(data[f])]))
+        });
+      }
     } catch (err) {
-      console.log('No profile found yet');
+      console.error('Failed to load vehicle profile:', err);
     }
+  };
+
+  const showMessage = (text, tone) => {
+    setMessage(text);
+    setMessageTone(tone);
   };
 
   const handleChange = (e) => {
     const { name, value } = e.target;
     setProfile(prev => ({ ...prev, [name]: value }));
+    // Drop the field's error highlight as soon as they start correcting it,
+    // rather than making them press Save again to see it clear.
+    setInvalidFields(prev => (prev.includes(name) ? prev.filter(f => f !== name) : prev));
   };
 
   const handleSave = async () => {
+    // Checked before anything else: a profile missing a dimension is worse than
+    // no profile at all, because Map.jsx quietly fills the gap with a default
+    // and the driver has no way to tell that's what they're routing on.
+    const missing = findMissingDimensions(profile);
+    if (missing.length) {
+      setInvalidFields(missing.map((f) => f.name));
+      showMessage(`Enter ${missing.map((f) => f.label).join(', ')} before saving`, 'error');
+      return;
+    }
+    setInvalidFields([]);
     setLoading(true);
     setMessage('');
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
-        setMessage('Please log in first');
+        showMessage('Please log in first', 'error');
         setLoading(false);
         return;
       }
+      // Resolve the conflict on user_id, not on the primary key. The previous
+      // upsert spread the whole profile object and relied on `id` being in it,
+      // so any save made before a profile had loaded inserted a second row
+      // rather than updating the existing one — which then broke the load
+      // above and compounded on every save after that. An explicit field list
+      // also keeps a loaded row's id/created_at out of the payload.
+      const { axles, load_type, speed_unit } = profile;
+      // Blank dimensions go to the database as NULL rather than '' (see
+      // toNumericOrNull). Map.jsx then falls back to its generic defaults for
+      // whichever ones are unset, exactly as it does for a driver who has
+      // never saved a profile at all.
+      const dimensions = Object.fromEntries(
+        NUMERIC_FIELDS.map((f) => [f, toNumericOrNull(profile[f])])
+      );
       const { error } = await supabase
         .from('vehicle_profiles')
-        .upsert({ user_id: user.id, ...profile });
+        .upsert(
+          {
+            user_id: user.id,
+            ...dimensions,
+            axles,
+            load_type,
+            ...(speed_unit === undefined ? {} : { speed_unit }),
+            updated_at: new Date().toISOString()
+          },
+          { onConflict: 'user_id' }
+        );
       if (error) throw error;
-      setMessage('Profile saved!');
-      onProfileUpdate(profile);
+      showMessage('Profile saved!', 'success');
+      // The coerced numbers, not the raw form strings, so routing works from
+      // the same values that were just persisted.
+      onProfileUpdate({ ...profile, ...dimensions });
       syncInspectionStationsIfEmpty();
       // Brief pause so the confirmation is actually readable before the
       // section tucks itself away.
       setTimeout(() => setExpanded(false), 800);
     } catch (err) {
-      setMessage(`Error: ${err.message}`);
+      showMessage(`Error: ${err.message}`, 'error');
     } finally {
       setLoading(false);
     }
@@ -139,12 +204,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
 
       <div style={{ display: 'grid', gridTemplateRows: expanded ? '1fr' : '0fr', transition: 'grid-template-rows 200ms ease-out' }}>
         <div style={{ overflow: 'hidden', minHeight: 0 }}>
-          {[
-            { label: 'Height (m)', name: 'height' },
-            { label: 'Width (m)', name: 'width' },
-            { label: 'Length (m)', name: 'length' },
-            { label: 'Weight (kg)', name: 'weight' },
-          ].map(field => (
+          {DIMENSION_FIELDS.map(field => (
             <div key={field.name} style={{ marginBottom: '10px' }}>
               <label style={LABEL_STYLE}>
                 {field.label}
@@ -154,7 +214,10 @@ const VehicleProfile = ({ onProfileUpdate }) => {
                 name={field.name}
                 value={profile[field.name]}
                 onChange={handleChange}
-                style={INPUT_STYLE}
+                aria-invalid={invalidFields.includes(field.name)}
+                style={invalidFields.includes(field.name)
+                  ? { ...INPUT_STYLE, borderColor: '#dc2626' }
+                  : INPUT_STYLE}
               />
             </div>
           ))}
@@ -221,7 +284,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
             <p style={{
               marginTop: '10px',
               fontSize: '12px',
-              color: message.includes('Error') ? '#dc2626' : 'var(--color-route-normal)',
+              color: messageTone === 'error' ? '#dc2626' : 'var(--color-route-normal)',
               textAlign: 'center'
             }}>
               {message}
