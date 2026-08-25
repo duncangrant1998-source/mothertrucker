@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# Local environment files. Every VITE_-prefixed var here is compiled into the
+# client bundle and is public by design; anything that is genuinely secret
+# (e.g. SENTRY_AUTH_TOKEN) belongs in the Vercel project settings, not here.
+.env
+.env.*
+!.env.example
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
