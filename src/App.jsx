@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from './lib/supabase';
+import { setSentryUser } from './lib/sentry';
 import Map from './components/Map';
 import VehicleProfile from './components/VehicleProfile';
 import MenuDrawer from './components/MenuDrawer';
@@ -67,8 +68,13 @@ function App() {
   }, [effectiveColorScheme, showingAuthScreen]);
 
   useEffect(() => {
+    // Tagging every Sentry event with the Supabase user id is what makes a
+    // field report traceable to the tester who hit it. Set here rather than in
+    // Auth.jsx so it also covers a restored session on app open, and clears on
+    // sign-out. Id only — no email, no vehicle profile.
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user || null);
+      setSentryUser(session?.user?.id ?? null);
       setLoading(false);
     });
 
@@ -76,6 +82,7 @@ function App() {
     // they still need to actually set a new password before entering the app.
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       setUser(session?.user || null);
+      setSentryUser(session?.user?.id ?? null);
       if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true);
     });
 
