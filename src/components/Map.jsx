@@ -93,6 +93,49 @@ const NAV_ANIM_MIN_MS = 300;
 const NAV_ANIM_MAX_MS = 2000;
 const NAV_ANIM_DEFAULT_MS = 1000;
 
+// If the animation loop hasn't ticked in this long while navigating is still
+// true, something outside the loop stopped it (a cancelled frame, a throw in
+// a place we don't control, a browser that stopped servicing rAF). The
+// watchdog restarts it rather than leaving the driver on a frozen map.
+const NAV_RAF_WATCHDOG_MS = 2000;
+// A GPS fix older than this is a cached/stale reading, not a live one.
+const NAV_STALE_FIX_MS = 5000;
+
+// --- navigation diagnostics -------------------------------------------
+// Field instrumentation for the in-vehicle camera/tracking failures. The
+// symptoms (no rotation, no recentering, frozen readouts) only reproduce on a
+// real phone with real GPS behind the login wall, so the device has to report
+// what it saw.
+//
+// ON by default while this is under active investigation. Silence it with
+//   localStorage.setItem('navDebug', 'off')   (then reload)
+// and re-enable with 'on'. Every line is also picked up as a Sentry console
+// breadcrumb (scrubbed in lib/sentry.js), so once VITE_SENTRY_DSN is actually
+// set in Vercel, any thrown error arrives carrying the preceding fix history.
+let navDebugEnabled = true;
+try {
+  navDebugEnabled = localStorage.getItem('navDebug') !== 'off';
+} catch {
+  // Private mode / storage blocked — leave diagnostics on.
+}
+const navLog = (...args) => {
+  if (navDebugEnabled) console.log('[nav]', ...args);
+};
+// Per-frame logging at 60fps would drown the console and the breadcrumb ring
+// buffer, so frame-rate diagnostics are sampled instead.
+const navThrottleState = new Map();
+const navLogEvery = (key, intervalMs, build) => {
+  if (!navDebugEnabled) return;
+  const now = Date.now();
+  const last = navThrottleState.get(key) ?? 0;
+  if (now - last < intervalMs) return;
+  navThrottleState.set(key, now);
+  console.log('[nav]', ...build());
+};
+const fmt = (value, digits = 1) => (
+  typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : String(value)
+);
+
 // Distance thresholds for the two-stage proximity alert system (stations,
 // highway exits, and turn maneuvers all share the same pipeline).
 const ALERT_TOAST_METERS = 2000;
@@ -574,20 +617,47 @@ const buildNavActions = (section, cumulative) => (section.actions || []).map((ac
   distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1]
 }));
 
-// Top-down truck silhouette (cab + cargo box) instead of a plain arrow, so
-// the marker itself reads as "truck" — rotates with heading, cab pointing
-// in the direction of travel, matching the chase camera's rotation.
-const createDriverIcon = (headingDeg) => new H.map.Icon(
-  '<svg xmlns="http://www.w3.org/2000/svg" width="34" height="44" viewBox="0 0 34 44">' +
-    `<g transform="rotate(${headingDeg} 17 22)">` +
-      '<rect x="6" y="12" width="22" height="28" rx="3" fill="#2563eb" stroke="white" stroke-width="2"/>' +
-      '<rect x="11" y="3" width="12" height="10" rx="2" fill="#2563eb" stroke="white" stroke-width="2"/>' +
-      '<line x1="10" y1="20" x2="24" y2="20" stroke="white" stroke-width="1.2" opacity="0.55"/>' +
-      '<line x1="10" y1="28" x2="24" y2="28" stroke="white" stroke-width="1.2" opacity="0.55"/>' +
-    '</g>' +
-  '</svg>',
-  { size: { w: 34, h: 44 }, anchor: { x: 17, y: 22 } }
-);
+// Top-down truck silhouette (cab + cargo box), drawn pointing straight up
+// and never rotated.
+//
+// It used to be re-rendered per fix as `rotate(${headingDeg} 17 22)`, which
+// was wrong twice over. The chase camera already rotates the whole map to the
+// driver's heading, so direction of travel is *always* screen-up during
+// navigation — rotating the icon by the same heading applied the rotation a
+// second time and pointed the truck at 2x its real bearing. And a 22x37
+// silhouette cannot survive an arbitrary rotation inside a 34x44 viewBox: at
+// heading 90 the cab lands at x=36, outside the canvas, so the marker was
+// clipped down to a sliver whenever the truck drove east or west.
+//
+// Because it no longer depends on heading, the icon is built once and reused.
+// The old version allocated a fresh H.map.Icon on every animation frame (~60
+// per second), each one kicking off its own async SVG raster decode, so the
+// marker was frequently swapped to a not-yet-decoded bitmap mid-drive.
+const DRIVER_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">' +
+    // Soft halo: keeps the marker findable against both satellite imagery and
+    // the dark topo scheme without needing a second map object.
+    '<circle cx="28" cy="28" r="22" fill="#2563eb" opacity="0.20"/>' +
+    '<circle cx="28" cy="28" r="22" fill="none" stroke="#fff" stroke-width="1.5" opacity="0.35"/>' +
+    '<rect x="17" y="16" width="22" height="28" rx="3" fill="#2563eb" stroke="#fff" stroke-width="2.5"/>' +
+    '<rect x="22" y="7" width="12" height="10" rx="2" fill="#2563eb" stroke="#fff" stroke-width="2.5"/>' +
+    '<line x1="21" y1="24" x2="35" y2="24" stroke="#fff" stroke-width="1.4" opacity="0.6"/>' +
+    '<line x1="21" y1="32" x2="35" y2="32" stroke="#fff" stroke-width="1.4" opacity="0.6"/>' +
+  '</svg>';
+
+// Lazy rather than module-level: `H` is a global from index.html's script
+// tags, and this keeps icon construction inside the component lifecycle where
+// a failure is catchable, rather than at import time.
+let driverIconCache = null;
+const getDriverIcon = () => {
+  if (!driverIconCache) {
+    driverIconCache = new H.map.Icon(DRIVER_ICON_SVG, {
+      size: { w: 56, h: 56 },
+      anchor: { x: 28, y: 28 }
+    });
+  }
+  return driverIconCache;
+};
 
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({
   '&': '&amp;',
@@ -630,6 +700,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   //   duration, settled } for the requestAnimationFrame loop below.
   const navAnimRef = useRef(null);
   const navRafRef = useRef(null);
+  // Loop health, reported by the diagnostics and by the watchdog. Counters
+  // rather than booleans so a drive log shows whether a failure happened once
+  // or on every frame.
+  const navFrameCountRef = useRef(0);
+  const navFrameErrorsRef = useRef(0);
+  const navCameraErrorsRef = useRef(0);
+  const navFixCountRef = useRef(0);
+  const navLastFrameAtRef = useRef(0);
+  const navWatchdogRef = useRef(null);
+  const navWatchdogRestartsRef = useRef(0);
+  // The plain start/end pins from the route preview. They were only ever
+  // added, never removed, so they stayed on the map for the whole drive.
+  const routeEndpointMarkersRef = useRef([]);
   const recalculatingRef = useRef(false);
   // Consecutive fixes in a row measured > REROUTE_TRIGGER_METERS from the
   // route — reset to 0 the moment a fix comes back within range.
@@ -768,6 +851,46 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       platformRef.current = platform;
       uiRef.current = ui;
     }
+  }, []);
+
+  // HERE sizes its canvas and projection once at construction and does not
+  // observe the container afterwards — H.map.ViewPort#resize() has to be
+  // called by hand whenever the element's box changes. Nothing did.
+  //
+  // This matters most on exactly the device the app is used on: in mobile
+  // Safari the URL bar collapses and expands while driving, which resizes the
+  // 100%-height map container underneath a projection still configured for the
+  // old height. The rendered centre then sits away from the visual centre, so
+  // a camera that is correctly centred on the driver still draws them off to
+  // one side — and the offset changes every time the chrome moves.
+  useEffect(() => {
+    const map = mapInstance.current;
+    const el = mapRef.current;
+    if (!map || !el) return;
+
+    const resize = () => {
+      try {
+        map.getViewPort().resize();
+      } catch (err) {
+        console.error('[nav] viewport resize failed', err);
+      }
+    };
+
+    // ResizeObserver catches container-driven changes (drawer, orientation,
+    // safe-area shifts); visualViewport catches the browser chrome sliding
+    // over the page without the element's own box changing.
+    const observer = new ResizeObserver(resize);
+    observer.observe(el);
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', resize);
+    resize();
+
+    return () => {
+      observer.disconnect();
+      vv?.removeEventListener('resize', resize);
+      window.removeEventListener('orientationchange', resize);
+    };
   }, []);
 
   // Swaps the base tile layer — route polylines, markers, and the grid
@@ -985,6 +1108,24 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       wakeLockRef.current = null;
     };
   }, [navigating]);
+
+  // Unmount (in practice: sign-out) while still navigating. The GPS watch and
+  // the animation frame were already outliving the component here; the
+  // watchdog makes that actively harmful rather than merely wasteful, since a
+  // repeating timer would keep rescheduling frames against a map that no
+  // longer exists. Everything nav-related is torn down in one place.
+  useEffect(() => () => {
+    if (watchIdRef.current != null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (navRafRef.current != null) {
+      cancelAnimationFrame(navRafRef.current);
+      navRafRef.current = null;
+    }
+    clearInterval(navWatchdogRef.current);
+    navWatchdogRef.current = null;
+  }, []);
 
   const handleSelectSpeedUnit = async (unit) => {
     setSpeedUnit(unit);
@@ -1395,6 +1536,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       ];
       const startMarker = new H.map.Marker({ lat: start.lat, lng: start.lng });
       const endMarker = new H.map.Marker({ lat: end.lat, lng: end.lng });
+      // Tracked so startNavigation can clear them — they belong to the route
+      // preview, not to the driving view.
+      if (routeEndpointMarkersRef.current.length) {
+        mapInstance.current.removeObjects(routeEndpointMarkersRef.current);
+      }
+      routeEndpointMarkersRef.current = [startMarker, endMarker];
       mapInstance.current.addObjects([...orderedPolylines, startMarker, endMarker]);
 
       const combinedBounds = options.reduce((acc, opt) => {
@@ -1493,30 +1640,78 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // forward-biasing (recentering below screen-center) doesn't compose with a
   // rotated/tilted camera the way it did for the old flat north-up view, so
   // this replaces that with HERE's own look-at heading/tilt instead.
+  // setLookAtData is the single point where "the map should be following the
+  // driver" becomes visible, so nothing here is allowed to fail silently.
+  //
+  // Only `position` and `zoom` are validated by the SDK (mapsjs-core 3.2.8.0
+  // throws InvalidArgumentError on a non-numeric lat/lng or a NaN zoom);
+  // `heading` and `tilt` are passed through unchecked, so a NaN heading does
+  // not throw — it quietly poisons the camera matrix instead. Both cases are
+  // guarded before the call rather than after.
+  //
+  // Returns true if the camera was actually updated.
   const updateNavCamera = (lat, lng, headingDeg) => {
-    mapInstance.current.getViewModel().setLookAtData({
-      position: { lat, lng },
-      zoom: NAV_ZOOM,
-      heading: headingDeg,
-      tilt: NAV_TILT
-    });
+    if (!mapInstance.current) return false;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      navLog('camera SKIPPED — non-finite position', { lat, lng });
+      return false;
+    }
+    // Rather than letting a bad heading through to the renderer, fall back to
+    // north-up: a map that stops rotating is recoverable, a NaN camera is not.
+    const heading = Number.isFinite(headingDeg) ? normalizeDegrees(headingDeg) : 0;
+    const lookAt = { position: { lat, lng }, zoom: NAV_ZOOM, heading, tilt: NAV_TILT };
+
+    try {
+      const viewModel = mapInstance.current.getViewModel();
+      viewModel.setLookAtData(lookAt);
+
+      // Read back what the map reports *after* the call. This is the check
+      // that distinguishes "we asked and the SDK ignored it" from "we never
+      // asked" — the two produce an identical frozen north-up map on screen
+      // but need completely different fixes.
+      navLogEvery('camera', 1000, () => {
+        const actual = viewModel.getLookAtData();
+        return ['camera set', {
+          asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt: NAV_TILT },
+          got: {
+            lat: +fmt(actual?.position?.lat, 5),
+            lng: +fmt(actual?.position?.lng, 5),
+            heading: +fmt(actual?.heading),
+            zoom: +fmt(actual?.zoom, 2),
+            tilt: +fmt(actual?.tilt)
+          },
+          applied: {
+            heading: Math.abs((actual?.heading ?? 0) - heading) < 1,
+            tilt: Math.abs((actual?.tilt ?? 0) - NAV_TILT) < 1,
+            zoom: Math.abs((actual?.zoom ?? 0) - NAV_ZOOM) < 0.5
+          }
+        }];
+      });
+      return true;
+    } catch (err) {
+      navCameraErrorsRef.current += 1;
+      // Not throttled: this is the failure the whole investigation is about.
+      console.error('[nav] setLookAtData THREW', lookAt, err);
+      return false;
+    }
   };
 
-  // Single place that actually paints a driver pose — feeds the exact same
-  // heading value to both the marker icon rotation and the map's course-up
-  // bearing so they can never drift apart, then records what's now on
-  // screen as the animation's next "from" anchor.
+  // Single place that actually paints a driver pose. The marker no longer
+  // carries a rotation of its own — the camera's heading rotates the entire
+  // map, so the (unrotated, cached) truck icon is already pointing along the
+  // direction of travel. See DRIVER_ICON_SVG.
   const renderDriverPose = (lat, lng, headingDeg) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
     const pos = { lat, lng };
     if (!driverMarkerRef.current) {
-      driverMarkerRef.current = new H.map.Marker(pos, { icon: createDriverIcon(headingDeg) });
+      driverMarkerRef.current = new H.map.Marker(pos, { icon: getDriverIcon() });
       mapInstance.current.addObject(driverMarkerRef.current);
+      navLog('driver marker created', pos);
     } else {
       driverMarkerRef.current.setGeometry(pos);
-      driverMarkerRef.current.setIcon(createDriverIcon(headingDeg));
     }
     updateNavCamera(lat, lng, headingDeg);
-    displayedPoseRef.current = { lat, lng, heading: headingDeg };
+    displayedPoseRef.current = { lat, lng, heading: Number.isFinite(headingDeg) ? headingDeg : 0 };
   };
 
   // Runs continuously while navigating, animating the marker/camera from
@@ -1524,18 +1719,65 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // between fixes, instead of snapping on every ~1s watchPosition callback.
   // Heading interpolates along the shortest angular path so a 359°→1° turn
   // doesn't spin the long way round.
+  //
+  // The reschedule is deliberately outside the try/catch and is the last
+  // statement in the function: previously a single throw anywhere in the frame
+  // body skipped requestAnimationFrame entirely, so the loop never ran again
+  // and the camera, the marker and (via the same throw path) the instruction
+  // and distance readouts all stopped for the rest of the drive with nothing
+  // logged. One bad frame is now survivable.
   const stepNavAnimation = () => {
-    const anim = navAnimRef.current;
-    if (anim && !anim.settled) {
-      const now = performance.now();
-      const t = anim.duration > 0 ? Math.min(1, (now - anim.startTime) / anim.duration) : 1;
-      const lat = anim.fromLat + (anim.toLat - anim.fromLat) * t;
-      const lng = anim.fromLng + (anim.toLng - anim.fromLng) * t;
-      const heading = normalizeDegrees(anim.fromHeading + shortestAngleDelta(anim.fromHeading, anim.toHeading) * t);
-      renderDriverPose(lat, lng, heading);
-      if (t >= 1) anim.settled = true;
+    navLastFrameAtRef.current = Date.now();
+    navFrameCountRef.current += 1;
+    try {
+      const anim = navAnimRef.current;
+      if (anim && !anim.settled) {
+        const now = performance.now();
+        const t = anim.duration > 0 ? Math.min(1, (now - anim.startTime) / anim.duration) : 1;
+        const lat = anim.fromLat + (anim.toLat - anim.fromLat) * t;
+        const lng = anim.fromLng + (anim.toLng - anim.fromLng) * t;
+        const heading = normalizeDegrees(anim.fromHeading + shortestAngleDelta(anim.fromHeading, anim.toHeading) * t);
+        renderDriverPose(lat, lng, heading);
+        if (t >= 1) anim.settled = true;
+      }
+      navLogEvery('frames', 5000, () => ['loop alive', {
+        frames: navFrameCountRef.current,
+        frameErrors: navFrameErrorsRef.current,
+        cameraErrors: navCameraErrorsRef.current,
+        animating: Boolean(navAnimRef.current && !navAnimRef.current.settled)
+      }]);
+    } catch (err) {
+      navFrameErrorsRef.current += 1;
+      console.error('[nav] stepNavAnimation frame FAILED (loop continues)', err);
+      // Retire the current animation so a poisoned one can't rethrow on every
+      // frame from here to the end of the trip; the next GPS fix installs a
+      // fresh one and tracking resumes on its own.
+      if (navAnimRef.current) navAnimRef.current.settled = true;
     }
     navRafRef.current = requestAnimationFrame(stepNavAnimation);
+  };
+
+  // Belt and braces around the loop above. If frames stop arriving for any
+  // reason we don't control while navigation is still active, restart it.
+  const startNavAnimationLoop = () => {
+    if (navRafRef.current != null) cancelAnimationFrame(navRafRef.current);
+    navLastFrameAtRef.current = Date.now();
+    navRafRef.current = requestAnimationFrame(stepNavAnimation);
+
+    clearInterval(navWatchdogRef.current);
+    navWatchdogRef.current = setInterval(() => {
+      const since = Date.now() - navLastFrameAtRef.current;
+      // document.hidden covers the legitimate case: browsers stop servicing
+      // rAF for a backgrounded tab, and that isn't a stall to recover from.
+      if (since > NAV_RAF_WATCHDOG_MS && !document.hidden) {
+        navWatchdogRestartsRef.current += 1;
+        console.warn('[nav] animation loop stalled', {
+          msSinceLastFrame: since,
+          restarts: navWatchdogRestartsRef.current
+        });
+        navRafRef.current = requestAnimationFrame(stepNavAnimation);
+      }
+    }, NAV_RAF_WATCHDOG_MS);
   };
 
   const applyNavRoute = (section) => {
@@ -1634,13 +1876,50 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     }
   };
 
+  // watchPosition keeps running after an error — a TIMEOUT is the browser
+  // saying "no fix yet", not the end of the watch. Logged with the elapsed
+  // gap because a run of these is what a frozen distance readout looks like
+  // from the inside: the app is fine, the fixes simply stopped arriving.
   const handlePositionError = (err) => {
-    console.error('Geolocation error:', err);
+    const codes = { 1: 'PERMISSION_DENIED', 2: 'POSITION_UNAVAILABLE', 3: 'TIMEOUT' };
+    console.error('[nav] geolocation error', {
+      code: err.code,
+      name: codes[err.code] ?? 'UNKNOWN',
+      message: err.message,
+      msSinceLastFix: lastFixTimestampRef.current ? Date.now() - lastFixTimestampRef.current : null,
+      fixesSoFar: navFixCountRef.current
+    });
     setError(`Location error: ${err.message}`);
   };
 
   const handlePositionUpdate = (position) => {
-    const { latitude, longitude, speed } = position.coords;
+    const { latitude, longitude, speed, heading: gpsHeading, accuracy } = position.coords;
+
+    // STAGE 1: every raw fix exactly as the device handed it over, before any
+    // of this app's processing touches it. `age` is what exposes a cached or
+    // replayed fix pretending to be live.
+    navFixCountRef.current += 1;
+    const fixAge = Date.now() - position.timestamp;
+    navLog('fix', {
+      n: navFixCountRef.current,
+      lat: latitude,
+      lng: longitude,
+      gpsHeading,
+      speed,
+      accuracy,
+      timestamp: position.timestamp,
+      ageMs: fixAge,
+      stale: fixAge > NAV_STALE_FIX_MS,
+      sinceLastFixMs: lastFixTimestampRef.current ? position.timestamp - lastFixTimestampRef.current : null
+    });
+
+    // A fix without usable coordinates can't drive anything downstream, and
+    // letting it through is what poisons the heading and then the camera.
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      console.warn('[nav] fix DISCARDED — non-finite coordinates', { latitude, longitude });
+      return;
+    }
+
     const currentPos = { lat: latitude, lng: longitude };
     const prev = lastPositionRef.current;
     const prevTimestamp = lastFixTimestampRef.current;
@@ -1674,7 +1953,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // outright wrong at low/moderate truck speed. See deriveTargetHeading.
     const rawHeading = deriveTargetHeading(onRoute, points, cumulative, index, prev, currentPos);
     const belowHeadingSpeed = estimatedSpeedMps != null && estimatedSpeedMps < MIN_HEADING_SPEED_MPS;
-    if (rawHeading != null && (!belowHeadingSpeed || smoothedHeadingRef.current == null)) {
+    // Number.isFinite, not `!= null`: NaN passes a null check, and because the
+    // smoothed value is fed back into itself on the next fix, one NaN would
+    // latch the heading to NaN permanently.
+    if (Number.isFinite(rawHeading) && (!belowHeadingSpeed || smoothedHeadingRef.current == null)) {
       if (onRoute || smoothedHeadingRef.current == null) {
         // Route-derived heading only changes when the matched index moves
         // onto a genuinely different-angled segment, so it's applied
@@ -1690,7 +1972,24 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         );
       }
     }
-    const targetHeading = smoothedHeadingRef.current ?? 0;
+    const targetHeading = Number.isFinite(smoothedHeadingRef.current) ? smoothedHeadingRef.current : 0;
+
+    // STAGE 2: the derived heading for this fix, alongside what it was derived
+    // from. A `raw: null` here with onRoute false is the off-route fallback
+    // having no previous fix to take a bearing from; a frozen `target` across
+    // many fixes while moving is the low-speed gate refusing to update.
+    navLog('heading', {
+      raw: rawHeading,
+      smoothed: smoothedHeadingRef.current,
+      target: targetHeading,
+      source: onRoute ? 'route-bearing' : 'gps-bearing',
+      onRoute,
+      routeDistM: +fmt(distance),
+      index,
+      speedMps: speedMps != null ? +fmt(speedMps, 2) : null,
+      estSpeedMps: estimatedSpeedMps != null ? +fmt(estimatedSpeedMps, 2) : null,
+      gatedByLowSpeed: belowHeadingSpeed
+    });
 
     const isFirstFix = displayedPoseRef.current == null;
     const fromPose = isFirstFix ? { lat: latitude, lng: longitude, heading: targetHeading } : displayedPoseRef.current;
@@ -1709,7 +2008,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     };
     if (isFirstFix) {
       // Nothing rendered yet to animate from — paint the first fix immediately.
-      renderDriverPose(latitude, longitude, targetHeading);
+      // Contained: this used to sit directly in the handler's path, so a throw
+      // in the camera meant every `setCurrentInstruction`/`setTripStats` call
+      // below was skipped too. That is the mechanism behind a distance readout
+      // freezing while the vehicle is plainly still moving — and because
+      // `displayedPoseRef` is only assigned *after* the camera call, the throw
+      // also kept `isFirstFix` true, so it recurred on every single fix.
+      try {
+        renderDriverPose(latitude, longitude, targetHeading);
+      } catch (err) {
+        console.error('[nav] first-fix render FAILED (readouts continue)', err);
+      }
     }
 
     if (!points || !points.length) return;
@@ -1845,17 +2154,42 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     offRouteStreakRef.current = 0;
     lastRerouteAttemptRef.current = 0;
 
+    navFrameCountRef.current = 0;
+    navFrameErrorsRef.current = 0;
+    navCameraErrorsRef.current = 0;
+    navFixCountRef.current = 0;
+    navWatchdogRestartsRef.current = 0;
+
     mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
+    // The route preview's plain start/end pins were previously left behind, so
+    // two default HERE markers sat on the map for the whole drive alongside
+    // the truck.
+    if (routeEndpointMarkersRef.current.length) {
+      mapInstance.current.removeObjects(routeEndpointMarkersRef.current);
+      routeEndpointMarkersRef.current = [];
+    }
     applyNavRoute(selected.section);
     setNavigating(true);
     onNavigatingChange?.(true);
 
+    navLog('navigation STARTED', {
+      routeId: selected.id,
+      points: navRoutePointsRef.current?.length ?? 0,
+      lengthM: navTotalLengthRef.current
+    });
+
     watchIdRef.current = navigator.geolocation.watchPosition(handlePositionUpdate, handlePositionError, {
       enableHighAccuracy: true,
-      maximumAge: 0,
-      timeout: 20000
+      // Was 0, which forbids the browser from ever returning a recently
+      // acquired fix and forces a fresh hardware acquisition for every single
+      // update. On mobile that measurably slows the delivery rate, and a
+      // 20000ms timeout on top meant a slow acquisition could stall updates
+      // for the full twenty seconds — which matches the reported freeze
+      // duration. A 2s cache costs nothing at road speed.
+      maximumAge: 2000,
+      timeout: 30000
     });
-    navRafRef.current = requestAnimationFrame(stepNavAnimation);
+    startNavAnimationLoop();
   };
 
   const stopNavigation = () => {
@@ -1867,6 +2201,15 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       cancelAnimationFrame(navRafRef.current);
       navRafRef.current = null;
     }
+    clearInterval(navWatchdogRef.current);
+    navWatchdogRef.current = null;
+    navLog('navigation STOPPED', {
+      fixes: navFixCountRef.current,
+      frames: navFrameCountRef.current,
+      frameErrors: navFrameErrorsRef.current,
+      cameraErrors: navCameraErrorsRef.current,
+      watchdogRestarts: navWatchdogRestartsRef.current
+    });
     navAnimRef.current = null;
     displayedPoseRef.current = null;
     if (driverMarkerRef.current) {
