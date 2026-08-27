@@ -100,6 +100,9 @@ const NAV_ANIM_DEFAULT_MS = 1000;
 const NAV_RAF_WATCHDOG_MS = 2000;
 // A GPS fix older than this is a cached/stale reading, not a live one.
 const NAV_STALE_FIX_MS = 5000;
+// How often the camera is read back and the on-screen readout repainted.
+// Fast enough to look live, slow enough that the digits stay readable.
+const NAV_READBACK_MS = 200;
 
 // --- navigation diagnostics -------------------------------------------
 // Field instrumentation for the in-vehicle camera/tracking failures. The
@@ -134,6 +137,30 @@ const navLogEvery = (key, intervalMs, build) => {
 };
 const fmt = (value, digits = 1) => (
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : String(value)
+);
+
+// TEMPORARY — on-screen camera readout for the in-vehicle tilt/rotation
+// investigation. iOS Safari can't be remote-inspected without a Mac, so the
+// asked-vs-applied camera values have to be legible on the phone itself and
+// in a screen recording of it.
+//
+// Query param only, deliberately not persisted anywhere: a beta tester has no
+// way to end up with this stuck on, and closing the tab clears it. Enable with
+//   https://mothertrucker.vercel.app/?debug=1
+// Remove this flag, paintNavDebugOverlay, and the overlay JSX (search
+// "TEMPORARY") once the camera question is settled.
+const navDebugOverlayEnabled = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('debug') === '1';
+  } catch {
+    return false;
+  }
+})();
+
+// Fixed-width so the numbers don't jitter sideways as they change — a value
+// that shifts position every frame is much harder to read on a moving screen.
+const padNum = (value, width) => (
+  Number.isFinite(value) ? String(Math.round(value)).padStart(width) : '—'.padStart(width)
 );
 
 // Distance thresholds for the two-stage proximity alert system (stations,
@@ -710,6 +737,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const navLastFrameAtRef = useRef(0);
   const navWatchdogRef = useRef(null);
   const navWatchdogRestartsRef = useRef(0);
+  // TEMPORARY — see navDebugOverlayEnabled.
+  const navDebugBoxRef = useRef(null);
+  const navCameraReadbackAtRef = useRef(0);
   // The plain start/end pins from the route preview. They were only ever
   // added, never removed, so they stayed on the map for the whole drive.
   const routeEndpointMarkersRef = useRef([]);
@@ -1650,6 +1680,35 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // guarded before the call rather than after.
   //
   // Returns true if the camera was actually updated.
+  // TEMPORARY — see navDebugOverlayEnabled. Writes straight to the DOM rather
+  // than through React state: this is driven off the animation loop, and
+  // routing it through setState would re-render the whole map component
+  // several times a second just to move a debug readout.
+  const paintNavDebugOverlay = (asked, actual, applied, now) => {
+    const box = navDebugBoxRef.current;
+    if (!box) return;
+
+    const two = (n) => String(n).padStart(2, '0');
+    const d = new Date(now);
+    const clock = `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+    const fixAge = lastFixTimestampRef.current != null
+      ? (now - lastFixTimestampRef.current) / 1000
+      : null;
+
+    box.textContent = [
+      `NAV CAM ${clock}`,
+      `HDG ${padNum(asked.heading, 3)}>${padNum(actual?.heading, 3)} ${applied.heading ? 'OK' : 'FAIL'}`,
+      `TLT ${padNum(asked.tilt, 3)}>${padNum(actual?.tilt, 3)} ${applied.tilt ? 'OK' : 'FAIL'}`,
+      `ZM  ${padNum(asked.zoom, 3)}>${padNum(actual?.zoom, 3)} ${applied.zoom ? 'OK' : 'FAIL'}`,
+      `fix ${fixAge == null ? '—' : `${fixAge.toFixed(1)}s`}  n${navFixCountRef.current}`,
+      `raf ${navFrameCountRef.current} e${navFrameErrorsRef.current}/${navCameraErrorsRef.current}`
+    ].join('\n');
+
+    // The border is the at-a-glance signal in a screen recording: green means
+    // the map applied everything we asked for, red means it didn't.
+    box.style.borderColor = applied.heading && applied.tilt && applied.zoom ? '#22c55e' : '#ef4444';
+  };
+
   const updateNavCamera = (lat, lng, headingDeg) => {
     if (!mapInstance.current) return false;
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -1669,9 +1728,23 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       // that distinguishes "we asked and the SDK ignored it" from "we never
       // asked" — the two produce an identical frozen north-up map on screen
       // but need completely different fixes.
-      navLogEvery('camera', 1000, () => {
+      //
+      // Sampled rather than done per frame: getLookAtData() 60 times a second
+      // is wasted work, and a readout that changes that fast is unreadable on
+      // a phone in a moving vehicle.
+      const now = Date.now();
+      if (now - navCameraReadbackAtRef.current >= NAV_READBACK_MS) {
+        navCameraReadbackAtRef.current = now;
         const actual = viewModel.getLookAtData();
-        return ['camera set', {
+        const applied = {
+          // Shortest angular distance, so 359 vs 1 counts as applied rather
+          // than as a 358-degree miss.
+          heading: Math.abs(shortestAngleDelta(actual?.heading ?? 0, heading)) < 1,
+          tilt: Math.abs((actual?.tilt ?? 0) - NAV_TILT) < 1,
+          zoom: Math.abs((actual?.zoom ?? 0) - NAV_ZOOM) < 0.5
+        };
+        paintNavDebugOverlay({ heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, actual, applied, now);
+        navLogEvery('camera', 1000, () => ['camera set', {
           asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt: NAV_TILT },
           got: {
             lat: +fmt(actual?.position?.lat, 5),
@@ -1680,13 +1753,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             zoom: +fmt(actual?.zoom, 2),
             tilt: +fmt(actual?.tilt)
           },
-          applied: {
-            heading: Math.abs((actual?.heading ?? 0) - heading) < 1,
-            tilt: Math.abs((actual?.tilt ?? 0) - NAV_TILT) < 1,
-            zoom: Math.abs((actual?.zoom ?? 0) - NAV_ZOOM) < 0.5
-          }
-        }];
-      });
+          applied
+        }]);
+      }
       return true;
     } catch (err) {
       navCameraErrorsRef.current += 1;
@@ -2336,6 +2405,43 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       `}</style>
       {navigating && (
         <>
+          {/* TEMPORARY — camera diagnostics readout, ?debug=1 only. See
+              navDebugOverlayEnabled; delete this block along with it.
+
+              Anchored to the right edge at mid-height, which is the one
+              region nothing else claims during navigation: the instruction
+              banner owns the top, the trip-stats strip the bottom, and HERE's
+              zoom/scale/layer controls the bottom-left. pointerEvents: none so
+              it can never intercept a tap meant for the map, and it renders
+              only while navigating, so it can't cover the route card. */}
+          {navDebugOverlayEnabled && (
+            <div
+              ref={navDebugBoxRef}
+              style={{
+                position: 'absolute',
+                right: '8px',
+                top: '50%',
+                transform: 'translateY(-50%)',
+                zIndex: 2600,
+                pointerEvents: 'none',
+                whiteSpace: 'pre',
+                fontFamily: 'JetBrains Mono, ui-monospace, monospace',
+                // Sized for legibility in a downscaled screen recording, not
+                // for looking good next to the rest of the UI.
+                fontSize: '17px',
+                fontWeight: 700,
+                lineHeight: 1.3,
+                color: '#fff',
+                background: 'rgba(0,0,0,0.82)',
+                border: '3px solid #64748b',
+                borderRadius: '8px',
+                padding: '8px 10px',
+                textShadow: '0 1px 2px rgba(0,0,0,0.9)'
+              }}
+            >
+              {'NAV CAM —\nwaiting for\nfirst fix…'}
+            </div>
+          )}
           {/* Instruction banner, recalculating pill, and station alert all
               stack in normal document flow (not independent absolutely-
               positioned guesses at each other's height) so a long wrapped
