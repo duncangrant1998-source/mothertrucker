@@ -3,6 +3,16 @@ import { createPortal } from 'react-dom';
 import { supabase } from '../lib/supabase';
 import { getStationsNearRoute } from '../lib/inspectionStations';
 import { PROVINCE_PERMITS, getProvincesForBounds } from '../lib/provincePermits';
+import {
+  bearingDegrees,
+  destPoint,
+  deriveTargetHeading,
+  haversineMeters,
+  matchToRoute,
+  normalizeDegrees,
+  shortestAngleDelta
+} from '../lib/geo';
+import { decodeSectionGeometry } from '../lib/route';
 
 const WEIGH_STATION_TERMS = ['weigh station', 'inspection station'];
 
@@ -80,11 +90,6 @@ const REROUTE_SUCCESS_NOTICE_MS = 4000;
 // updates are frozen rather than fed to the marker/camera.
 const MIN_HEADING_SPEED_MPS = 5 / 3.6;
 
-// How far ahead along the route polyline (in meters) to look when deriving
-// heading from route geometry — far enough that two closely-spaced polyline
-// vertices don't produce a noisy near-zero-length bearing.
-const ROUTE_HEADING_LOOKAHEAD_METERS = 15;
-
 // GPS fixes arrive in bursts roughly once a second; the marker/camera are
 // animated from their last rendered pose to each new fix over this long,
 // clamped so a delayed or back-to-back-fast fix can't produce a stalled or
@@ -157,10 +162,57 @@ const navDebugOverlayEnabled = (() => {
   }
 })();
 
+// TEMPORARY — camera heading override for the stationary orientation test.
+//   ?debug=1&hdg=0    camera pinned to north-up
+//   ?debug=1&hdg=90   camera pinned to east-up
+// With the truck parked, this isolates whether an orientation error lives
+// inside the setLookAtData call or upstream in the heading pipeline: at
+// hdg=0 the 'N' probe marker must draw straight up, and at hdg=90 it must
+// swing to the left edge. Only readable when ?debug=1 is also set, so it
+// can't be reached by accident.
+const navDebugHeadingOverride = (() => {
+  if (!navDebugOverlayEnabled) return null;
+  try {
+    const raw = new URLSearchParams(window.location.search).get('hdg');
+    if (raw == null) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? normalizeDegrees(value) : null;
+  } catch {
+    return null;
+  }
+})();
+
+// TEMPORARY — bearing-probe markers for the orientation check, so the answer
+// is legible by eye in a screen recording and not only as digits. 'N' is
+// placed due north of the truck, 'F' along the heading the camera was asked
+// for. On a correctly oriented chase camera, F draws straight up the screen.
+const PROBE_MARKER_METERS = 200;
+const probeIconCache = new Map();
+const getProbeIcon = (letter, color) => {
+  if (!probeIconCache.has(letter)) {
+    probeIconCache.set(letter, new H.map.Icon(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="34" height="34" viewBox="0 0 34 34">' +
+        `<circle cx="17" cy="17" r="14" fill="${color}" stroke="#fff" stroke-width="3"/>` +
+        `<text x="17" y="23" text-anchor="middle" font-family="monospace" font-size="17" font-weight="700" fill="#fff">${letter}</text>` +
+      '</svg>',
+      { size: { w: 34, h: 34 }, anchor: { x: 17, y: 17 } }
+    ));
+  }
+  return probeIconCache.get(letter);
+};
+
 // Fixed-width so the numbers don't jitter sideways as they change — a value
 // that shifts position every frame is much harder to read on a moving screen.
 const padNum = (value, width) => (
   Number.isFinite(value) ? String(Math.round(value)).padStart(width) : '—'.padStart(width)
+);
+
+// Same, for values that are meaningful in both directions (pixel offsets,
+// angular error) where the sign is the whole point.
+const padSigned = (value, width) => (
+  Number.isFinite(value)
+    ? ((value < 0 ? '-' : '+') + String(Math.abs(Math.round(value)))).padStart(width)
+    : '—'.padStart(width)
 );
 
 // Distance thresholds for the two-stage proximity alert system (stations,
@@ -176,79 +228,8 @@ const ALERT_TOAST_DURATION_MS = 15000;
 // repeat the same instruction in a second banner underneath it.
 const STATION_ALERT_STYLE = { background: '#dc2626', color: 'white', defaultName: 'MTO Inspection Station' };
 
-const toRad = (deg) => (deg * Math.PI) / 180;
-const toDeg = (rad) => (rad * 180) / Math.PI;
-
-const haversineMeters = (a, b) => {
-  const R = 6371000;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const sinDLat = Math.sin(dLat / 2);
-  const sinDLng = Math.sin(dLng / 2);
-  const h = sinDLat * sinDLat + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinDLng * sinDLng;
-  return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
-};
-
-const bearingDegrees = (from, to) => {
-  const y = Math.sin(toRad(to.lng - from.lng)) * Math.cos(toRad(to.lat));
-  const x = Math.cos(toRad(from.lat)) * Math.sin(toRad(to.lat)) -
-    Math.sin(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.cos(toRad(to.lng - from.lng));
-  return (toDeg(Math.atan2(y, x)) + 360) % 360;
-};
-
-const normalizeDegrees = (deg) => ((deg % 360) + 360) % 360;
-
-// Signed shortest angular step from `from` to `to`, in (-180, 180] — used to
-// interpolate headings across the 359°→1° wraparound without spinning the
-// long way round.
-const shortestAngleDelta = (from, to) => ((to - from + 540) % 360) - 180;
-
-// Walks the cumulative-distance table to find a point a fixed distance ahead
-// of `index` along the route polyline, so route-derived heading is measured
-// over a short but non-trivial stretch of road rather than between two
-// nearly-identical adjacent vertices (which would be noisy).
-const lookaheadRoutePoint = (points, cumulative, index, metersAhead) => {
-  const targetDist = cumulative[index] + metersAhead;
-  for (let i = index; i < points.length; i++) {
-    if (cumulative[i] >= targetDist) return points[i];
-  }
-  return points[points.length - 1];
-};
-
-// Heading is derived from the route geometry ahead of the driver whenever
-// they're on-route: this is what production nav apps do, and unlike
-// GeolocationPosition.coords.heading (often null, or wildly noisy at low
-// speed) it can't jitter — it only changes once the matched route index
-// moves onto a genuinely different-angled segment. A GPS-fix-to-GPS-fix
-// bearing is the fallback for when there's no matched route to anchor to
-// (off-route / recalculating).
-const deriveTargetHeading = (onRoute, points, cumulative, index, prevPos, currentPos) => {
-  if (onRoute && points && points.length > 1) {
-    const origin = points[index];
-    const ahead = lookaheadRoutePoint(points, cumulative, index, ROUTE_HEADING_LOOKAHEAD_METERS);
-    if (ahead.lat !== origin.lat || ahead.lng !== origin.lng) {
-      return bearingDegrees(origin, ahead);
-    }
-  }
-  return prevPos ? bearingDegrees(prevPos, currentPos) : null;
-};
-
-const decodeRoutePoints = (polyline) => {
-  const flat = H.geo.LineString.fromFlexiblePolyline(polyline).getLatLngAltArray();
-  const points = [];
-  for (let i = 0; i < flat.length; i += 3) {
-    points.push({ lat: flat[i], lng: flat[i + 1] });
-  }
-  return points;
-};
-
-const buildCumulativeDistances = (points) => {
-  const cumulative = [0];
-  for (let i = 1; i < points.length; i++) {
-    cumulative.push(cumulative[i - 1] + haversineMeters(points[i - 1], points[i]));
-  }
-  return cumulative;
-};
+// Geodesy, route matching and heading derivation now live in lib/geo.js so
+// they can be unit-tested off-device — see the imports at the top of the file.
 
 // Counts inspection stations that lie ahead of the driver's current route
 // index, for the "MTO AHEAD" data panel column. Independent from the alert
@@ -258,28 +239,10 @@ const countStationsAhead = (points, stations, index) => {
   let count = 0;
   for (const station of stations) {
     if (station.latitude == null || station.longitude == null) continue;
-    const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+    const { index: stationIndex } = matchToRoute(points, null, station.latitude, station.longitude, 0, points.length - 1);
     if (stationIndex >= index) count++;
   }
   return count;
-};
-
-// Searches a window around fromIndex (the driver's last known position on the
-// route) instead of the whole polyline, since GPS ticks arrive ~once a second
-// and the driver can only have moved a short distance along the route.
-const nearestPointIndex = (points, lat, lng, fromIndex = 0, window = points.length) => {
-  const start = Math.max(0, fromIndex - 5);
-  const end = Math.min(points.length - 1, fromIndex + window);
-  let bestIndex = start;
-  let bestDistance = Infinity;
-  for (let i = start; i <= end; i++) {
-    const d = haversineMeters({ lat, lng }, points[i]);
-    if (d < bestDistance) {
-      bestDistance = d;
-      bestIndex = i;
-    }
-  }
-  return { index: bestIndex, distance: bestDistance };
 };
 
 const formatDistance = (meters) => {
@@ -641,7 +604,12 @@ const describeAction = (action) => {
 
 const buildNavActions = (section, cumulative) => (section.actions || []).map((action) => ({
   text: describeAction(action),
-  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1]
+  distanceMeters: cumulative[action.offset] ?? cumulative[cumulative.length - 1],
+  // A depart action sits at offset 0 — it marks where the driver already is,
+  // not a point to drive toward. The banner needs to know, so it can count
+  // down to the first real maneuver instead of showing a flat 0 m under an
+  // instruction that reads "go for 240 m".
+  isDepart: action.action === 'depart'
 }));
 
 // Top-down truck silhouette (cab + cargo box), drawn pointing straight up
@@ -740,6 +708,25 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // TEMPORARY — see navDebugOverlayEnabled.
   const navDebugBoxRef = useRef(null);
   const navCameraReadbackAtRef = useRef(0);
+  // H.map.Group holding the two bearing-probe markers ('N' due north, 'F'
+  // dead ahead). Its own group so the probes can be cleared without touching
+  // the truck marker or the route line.
+  const navDebugProbeGroupRef = useRef(null);
+  // Heading as it looks at each stage of the pipeline, for the overlay. The
+  // raw device course is recorded here purely so it can be displayed — it is
+  // deliberately never fed to the camera, see handlePositionUpdate.
+  const navHeadingStagesRef = useRef({ gps: null, derived: null, smoothed: null });
+  // Reroute bookkeeping surfaced in the overlay: how many attempts this drive,
+  // and how the last one ended ('run' | 'ok' | 'err' | 'nogeo:<reason>').
+  const navRerouteCountRef = useRef(0);
+  const navRerouteStatusRef = useRef('—');
+  // Why the last routing response was refused, if it was. Read by the reroute
+  // catch to tell "no geometry" apart from "the request failed".
+  const navRouteRejectReasonRef = useRef(null);
+  // Latest perpendicular distance from the route, in metres — the number that
+  // decides whether a reroute fires, and the one that was being measured to
+  // the nearest vertex instead of to the route itself.
+  const navRouteDistanceRef = useRef(null);
   // The plain start/end pins from the route preview. They were only ever
   // added, never removed, so they stayed on the map for the whole drive.
   const routeEndpointMarkersRef = useRef([]);
@@ -1684,7 +1671,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // than through React state: this is driven off the animation loop, and
   // routing it through setState would re-render the whole map component
   // several times a second just to move a debug readout.
-  const paintNavDebugOverlay = (asked, actual, applied, now) => {
+  const paintNavDebugOverlay = (asked, model, drawn, flags, now) => {
     const box = navDebugBoxRef.current;
     if (!box) return;
 
@@ -1694,19 +1681,127 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const fixAge = lastFixTimestampRef.current != null
       ? (now - lastFixTimestampRef.current) / 1000
       : null;
+    const stages = navHeadingStagesRef.current;
+    const ratio = Number.isFinite(drawn?.tiltRatio) ? drawn.tiltRatio.toFixed(2) : ' -- ';
+    const objects = mapInstance.current?.getObjects()?.length ?? null;
 
     box.textContent = [
       `NAV CAM ${clock}`,
-      `HDG ${padNum(asked.heading, 3)}>${padNum(actual?.heading, 3)} ${applied.heading ? 'OK' : 'FAIL'}`,
-      `TLT ${padNum(asked.tilt, 3)}>${padNum(actual?.tilt, 3)} ${applied.tilt ? 'OK' : 'FAIL'}`,
-      `ZM  ${padNum(asked.zoom, 3)}>${padNum(actual?.zoom, 3)} ${applied.zoom ? 'OK' : 'FAIL'}`,
+      // Heading at every stage it passes through, so a wrong value on screen
+      // can be pinned to the step that introduced it rather than guessed at.
+      // gps: the device's own course, which this app deliberately ignores.
+      // drv: derived from route geometry (or fix-to-fix bearing off-route).
+      // smo: after the low-speed gate and the off-route blend.
+      // set: the argument handed to setLookAtData.
+      // vm:  read back from getLookAtData — the ViewModel's stored model.
+      // DRW: measured off the rendered projection. The only one of these that
+      //      says anything about what the driver is actually looking at.
+      `HDG gps${padNum(stages.gps, 4)} drv${padNum(stages.derived, 4)}`,
+      `HDG smo${padNum(stages.smoothed, 4)} set${padNum(asked.heading, 4)}`,
+      `HDG vm ${padNum(model?.heading, 4)} DRW${padNum(drawn?.screenUpBearing, 4)}`,
+      `HDG err${padSigned(flags.headingErrorDeg, 4)} ${flags.heading ? 'OK  ' : 'FAIL'}`,
+      `TLT set${padNum(asked.tilt, 4)} vm ${padNum(model?.tilt, 4)}`,
+      // Ground metres above centre over ground metres below it. An untilted
+      // orthographic view covers the same distance in both, so this pins at
+      // 1.00 no matter what tilt the ViewModel claims to be holding.
+      `TLT ratio ${ratio} ${flags.tiltDrawn ? 'OK  ' : 'FLAT'}`,
+      `ZM  set${padNum(asked.zoom, 4)} vm ${padNum(model?.zoom, 4)} ${flags.zoom ? 'OK' : '!!'}`,
+      // Where the driver's own coordinates land on screen, in pixels from
+      // centre. This is "the truck walked off the top of the map" as a
+      // number: a camera that is tracking keeps both near zero.
+      `TRK dx${padSigned(drawn?.truckDx, 4)} dy${padSigned(drawn?.truckDy, 5)}`,
+      `RTE d${padNum(navRouteDistanceRef.current, 5)}m p${navRoutePointsRef.current?.length ?? 0}`,
+      `OFF ${offRouteStreakRef.current}/${REROUTE_CONFIRM_FIXES}    OBJ ${objects ?? '—'}`,
+      `RRT n${navRerouteCountRef.current} ${navRerouteStatusRef.current}`,
       `fix ${fixAge == null ? '—' : `${fixAge.toFixed(1)}s`}  n${navFixCountRef.current}`,
       `raf ${navFrameCountRef.current} e${navFrameErrorsRef.current}/${navCameraErrorsRef.current}`
     ].join('\n');
 
-    // The border is the at-a-glance signal in a screen recording: green means
-    // the map applied everything we asked for, red means it didn't.
-    box.style.borderColor = applied.heading && applied.tilt && applied.zoom ? '#22c55e' : '#ef4444';
+    // The border is the at-a-glance signal in a screen recording. It is now
+    // driven by what was *drawn*, not by what the ViewModel echoed back —
+    // the old version sat green through a drive where the map was pointing
+    // the wrong way and had never been tilted.
+    box.style.borderColor = flags.heading && flags.tiltDrawn && flags.zoom ? '#22c55e' : '#ef4444';
+  };
+
+  // Measures what the render engine actually drew, by round-tripping points
+  // through its own projection.
+  //
+  // getLookAtData() is not this, and the distinction is the whole reason the
+  // previous round of instrumentation came back clean from a drive where the
+  // map was visibly wrong: it returns the ViewModel's stored camera model —
+  // the values handed to it moments earlier — so it reports a heading the
+  // engine may never have turned to and a tilt it may never have drawn.
+  // screenToGeo/geoToScreen go through the camera matrix instead.
+  //
+  // Diagnostics are never allowed to be the thing that breaks navigation, so
+  // every failure here returns null rather than propagating.
+  const measureRenderedCamera = (map, driverPos) => {
+    try {
+      const viewPort = map.getViewPort();
+      const width = viewPort?.width || mapRef.current?.clientWidth || 0;
+      const height = viewPort?.height || mapRef.current?.clientHeight || 0;
+      if (!width || !height) return null;
+      const cx = width / 2;
+      const cy = height / 2;
+      // Kept well inside the viewport: under a steep tilt the upper probe can
+      // otherwise land beyond the horizon, where screenToGeo has no answer.
+      const probePx = Math.max(40, Math.min(120, Math.round(height * 0.15)));
+
+      const centre = map.screenToGeo(cx, cy);
+      const above = map.screenToGeo(cx, cy - probePx);
+      const below = map.screenToGeo(cx, cy + probePx);
+      if (!centre || !above || !below) return null;
+      if (!Number.isFinite(centre.lat) || !Number.isFinite(above.lat) || !Number.isFinite(below.lat)) return null;
+
+      const metresAbove = haversineMeters(centre, above);
+      const metresBelow = haversineMeters(centre, below);
+
+      let truckDx = null;
+      let truckDy = null;
+      if (driverPos) {
+        const screen = map.geoToScreen(driverPos);
+        if (screen && Number.isFinite(screen.x) && Number.isFinite(screen.y)) {
+          truckDx = screen.x - cx;
+          truckDy = screen.y - cy;
+        }
+      }
+
+      return {
+        screenUpBearing: bearingDegrees(centre, above),
+        tiltRatio: metresBelow > 0 ? metresAbove / metresBelow : null,
+        truckDx,
+        truckDy
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  // TEMPORARY — see navDebugOverlayEnabled. Two markers at known bearings
+  // from the truck, giving a by-eye cross-check on the numbers above that
+  // doesn't depend on the probe arithmetic being right.
+  const updateNavDebugProbes = (map, pos, heading) => {
+    if (!navDebugOverlayEnabled) return;
+    try {
+      const north = destPoint(pos, 0, PROBE_MARKER_METERS);
+      const ahead = destPoint(pos, heading, PROBE_MARKER_METERS);
+      if (!navDebugProbeGroupRef.current) {
+        const group = new H.map.Group();
+        group.addObjects([
+          new H.map.Marker(north, { icon: getProbeIcon('N', '#0ea5e9') }),
+          new H.map.Marker(ahead, { icon: getProbeIcon('F', '#f59e0b') })
+        ]);
+        map.addObject(group);
+        navDebugProbeGroupRef.current = group;
+      } else {
+        const [northMarker, aheadMarker] = navDebugProbeGroupRef.current.getObjects();
+        northMarker.setGeometry(north);
+        aheadMarker.setGeometry(ahead);
+      }
+    } catch (err) {
+      navLogEvery('probes', 5000, () => ['probe markers FAILED', err]);
+    }
   };
 
   const updateNavCamera = (lat, lng, headingDeg) => {
@@ -1717,43 +1812,60 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     }
     // Rather than letting a bad heading through to the renderer, fall back to
     // north-up: a map that stops rotating is recoverable, a NaN camera is not.
-    const heading = Number.isFinite(headingDeg) ? normalizeDegrees(headingDeg) : 0;
+    // The ?hdg= override pins the camera for the parked orientation test and
+    // is unreachable without ?debug=1.
+    const heading = navDebugHeadingOverride ?? (Number.isFinite(headingDeg) ? normalizeDegrees(headingDeg) : 0);
     const lookAt = { position: { lat, lng }, zoom: NAV_ZOOM, heading, tilt: NAV_TILT };
 
     try {
       const viewModel = mapInstance.current.getViewModel();
       viewModel.setLookAtData(lookAt);
 
-      // Read back what the map reports *after* the call. This is the check
-      // that distinguishes "we asked and the SDK ignored it" from "we never
-      // asked" — the two produce an identical frozen north-up map on screen
-      // but need completely different fixes.
-      //
-      // Sampled rather than done per frame: getLookAtData() 60 times a second
-      // is wasted work, and a readout that changes that fast is unreadable on
-      // a phone in a moving vehicle.
+      // Sampled rather than done per frame: the read-back and the projection
+      // probes are wasted work 60 times a second, and a readout that changes
+      // that fast is unreadable on a phone in a moving vehicle.
       const now = Date.now();
       if (now - navCameraReadbackAtRef.current >= NAV_READBACK_MS) {
         navCameraReadbackAtRef.current = now;
-        const actual = viewModel.getLookAtData();
-        const applied = {
-          // Shortest angular distance, so 359 vs 1 counts as applied rather
-          // than as a 358-degree miss.
-          heading: Math.abs(shortestAngleDelta(actual?.heading ?? 0, heading)) < 1,
-          tilt: Math.abs((actual?.tilt ?? 0) - NAV_TILT) < 1,
-          zoom: Math.abs((actual?.zoom ?? 0) - NAV_ZOOM) < 0.5
+        const model = viewModel.getLookAtData();
+        const drawn = measureRenderedCamera(mapInstance.current, { lat, lng });
+
+        // Judged against the rendered bearing, not the model's. Five degrees
+        // of slack because the probe measures a real projection over a finite
+        // pixel span; the failure this is looking for is 180, not 2.
+        const headingErrorDeg = drawn
+          ? shortestAngleDelta(heading, drawn.screenUpBearing)
+          : null;
+        const flags = {
+          headingErrorDeg,
+          heading: Number.isFinite(headingErrorDeg) && Math.abs(headingErrorDeg) < 5,
+          // A flat orthographic render puts equal ground above and below
+          // centre. NAV_TILT of 45 should push this comfortably past 1.2.
+          tiltDrawn: Number.isFinite(drawn?.tiltRatio) && drawn.tiltRatio > 1.05,
+          zoom: Math.abs((model?.zoom ?? 0) - NAV_ZOOM) < 0.5
         };
-        paintNavDebugOverlay({ heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, actual, applied, now);
+
+        paintNavDebugOverlay({ heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, model, drawn, flags, now);
+        updateNavDebugProbes(mapInstance.current, { lat, lng }, heading);
+
         navLogEvery('camera', 1000, () => ['camera set', {
           asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt: NAV_TILT },
-          got: {
-            lat: +fmt(actual?.position?.lat, 5),
-            lng: +fmt(actual?.position?.lng, 5),
-            heading: +fmt(actual?.heading),
-            zoom: +fmt(actual?.zoom, 2),
-            tilt: +fmt(actual?.tilt)
+          model: {
+            lat: +fmt(model?.position?.lat, 5),
+            lng: +fmt(model?.position?.lng, 5),
+            heading: +fmt(model?.heading),
+            zoom: +fmt(model?.zoom, 2),
+            tilt: +fmt(model?.tilt)
           },
-          applied
+          // What the engine drew, measured through its own projection —
+          // the only numbers here that describe the driver's actual view.
+          drawn: {
+            screenUpBearing: +fmt(drawn?.screenUpBearing),
+            tiltRatio: +fmt(drawn?.tiltRatio, 3),
+            truckDx: +fmt(drawn?.truckDx, 0),
+            truckDy: +fmt(drawn?.truckDy, 0)
+          },
+          flags
         }]);
       }
       return true;
@@ -1850,8 +1962,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   };
 
   const applyNavRoute = (section) => {
-    const points = decodeRoutePoints(section.polyline);
-    const cumulative = buildCumulativeDistances(points);
+    // Guard: a routing response can arrive complete enough to repopulate the
+    // instruction banner and flip the badge to "new route active" while
+    // carrying no usable geometry. Swapping that in leaves a blank map and
+    // nothing to measure off-route distance against, so the very next fix
+    // reads as off-route and fires another reroute — the failure loops
+    // silently instead of surfacing. Reject it and keep the route we have.
+    const { points, cumulative, reason } = decodeSectionGeometry(section);
+    if (!points) {
+      navRouteRejectReasonRef.current = reason;
+      console.error('[nav] route REJECTED — no usable geometry', { reason, section });
+      throw new Error(`Route response has no usable geometry (${reason})`);
+    }
+    navRouteRejectReasonRef.current = null;
     navRoutePointsRef.current = points;
     navCumulativeRef.current = cumulative;
     navActionsRef.current = buildNavActions(section, cumulative);
@@ -1866,7 +1989,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       cumulative,
       navTotalDurationRef.current
     );
+    // Progress-along-route state is indexed against the route that just went
+    // away, so all of it resets here rather than at each call site. The
+    // off-route streak in particular used to be cleared only on the reroute
+    // success path, so a route swap from anywhere else carried a partial
+    // streak into the new route and could confirm a reroute several fixes
+    // early.
     lastIndexRef.current = 0;
+    offRouteStreakRef.current = 0;
+    setCurrentInstruction(null);
+    setNextInstruction(null);
+    setCurrentSpeedLimit(null);
 
     // A new/recalculated route invalidates action offsets, so drop all
     // per-point alert bookkeeping and any alert currently on screen.
@@ -1929,8 +2062,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         axleCount: rerouteParams['vehicle[axleCount]']
       });
       const route = await calculateSingleRoute(router, rerouteParams);
+      // Throws if the response carries no usable geometry, which lands in the
+      // catch below as a visible failure rather than a silent bad swap. The
+      // off-route streak is reset inside applyNavRoute, alongside the rest of
+      // the progress state it invalidates.
       applyNavRoute(route.sections[0]);
-      offRouteStreakRef.current = 0;
+      navRerouteStatusRef.current = 'ok';
       clearTimeout(rerouteNoticeTimeoutRef.current);
       setRerouteNotice({ type: 'success', text: 'New route active' });
       rerouteNoticeTimeoutRef.current = setTimeout(() => {
@@ -1938,8 +2075,15 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       }, REROUTE_SUCCESS_NOTICE_MS);
     } catch (err) {
       console.error('Recalculation failed:', err);
+      const noGeometry = Boolean(navRouteRejectReasonRef.current);
+      navRerouteStatusRef.current = noGeometry ? `nogeo:${navRouteRejectReasonRef.current}` : 'err';
       clearTimeout(rerouteNoticeTimeoutRef.current);
-      setRerouteNotice({ type: 'failed', text: "Rerouting failed — couldn't reach the routing service. Retrying…" });
+      setRerouteNotice({
+        type: 'failed',
+        text: noGeometry
+          ? 'Rerouting failed — the new route came back without a map line. Keeping the current route.'
+          : "Rerouting failed — couldn't reach the routing service. Retrying…"
+      });
     } finally {
       setRecalculating(false);
     }
@@ -1999,11 +2143,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const points = navRoutePointsRef.current;
     const cumulative = navCumulativeRef.current;
 
+    // Perpendicular distance to the route *line*, and metres travelled along
+    // it, interpolated inside the matched segment — see matchToRoute. Both
+    // used to be measured against the nearest vertex, which is only a good
+    // approximation where vertices are dense.
     let index = lastIndexRef.current;
     let distance = 0;
+    let travelled = navCumulativeRef.current?.[lastIndexRef.current] ?? 0;
     if (points && points.length) {
-      ({ index, distance } = nearestPointIndex(points, latitude, longitude, lastIndexRef.current, 80));
+      ({ index, distance, travelled } = matchToRoute(points, cumulative, latitude, longitude, lastIndexRef.current, 80));
       lastIndexRef.current = index;
+      navRouteDistanceRef.current = distance;
     }
     const onRoute = Boolean(points && points.length) && distance <= OFF_ROUTE_METERS;
 
@@ -2020,7 +2170,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // Raw GeolocationPosition.coords.heading is intentionally never used
     // here — it's often null, and even when present is frequently noisy or
     // outright wrong at low/moderate truck speed. See deriveTargetHeading.
-    const rawHeading = deriveTargetHeading(onRoute, points, cumulative, index, prev, currentPos);
+    const rawHeading = deriveTargetHeading(onRoute, points, cumulative, travelled, prev, currentPos);
     const belowHeadingSpeed = estimatedSpeedMps != null && estimatedSpeedMps < MIN_HEADING_SPEED_MPS;
     // Number.isFinite, not `!= null`: NaN passes a null check, and because the
     // smoothed value is fed back into itself on the next fix, one NaN would
@@ -2042,6 +2192,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       }
     }
     const targetHeading = Number.isFinite(smoothedHeadingRef.current) ? smoothedHeadingRef.current : 0;
+    navHeadingStagesRef.current = {
+      gps: Number.isFinite(gpsHeading) ? gpsHeading : null,
+      derived: rawHeading,
+      smoothed: smoothedHeadingRef.current
+    };
 
     // STAGE 2: the derived heading for this fix, alongside what it was derived
     // from. A `raw: null` here with onRoute false is the off-route fallback
@@ -2102,6 +2257,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       offRouteStreakRef.current = 0;
     }
 
+    // Speed is a live instrument reading, not a route-derived one — it stays
+    // updating even while off-route and mid-reroute, where everything below
+    // this point is legitimately stale. It used to sit under the early return
+    // below, so the speedometer blanked for the whole duration of a reroute.
+    setCurrentSpeedMps(speedMps);
+
     if (offRouteStreakRef.current >= REROUTE_CONFIRM_FIXES) {
       const now = Date.now();
       const cooldownElapsed = now - lastRerouteAttemptRef.current >= REROUTE_COOLDOWN_MS;
@@ -2112,6 +2273,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       if (!recalculatingRef.current && cooldownElapsed) {
         recalculatingRef.current = true;
         lastRerouteAttemptRef.current = now;
+        navRerouteCountRef.current += 1;
+        navRerouteStatusRef.current = 'run';
         setRecalculating(true);
         recalculateFromCurrentPosition(latitude, longitude).finally(() => {
           recalculatingRef.current = false;
@@ -2120,14 +2283,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       return;
     }
 
-    const travelled = cumulative[index];
     const upcoming = navActionsRef.current.filter((a) => a.distanceMeters >= travelled - 20);
     const next = upcoming[0] || null;
     const after = upcoming[1] || null;
-    setCurrentInstruction(next ? { text: next.text, distanceMeters: Math.max(0, next.distanceMeters - travelled) } : null);
+    // Distance to the maneuver the banner is naming. For a depart action that
+    // is the first real turn, since departing is not something the driver
+    // travels toward — otherwise the headline number read 0 m underneath an
+    // instruction saying to carry on for a couple of hundred metres.
+    const nextTargetMeters = next && next.isDepart && after ? after.distanceMeters : next?.distanceMeters;
+    setCurrentInstruction(next ? { text: next.text, distanceMeters: Math.max(0, nextTargetMeters - travelled) } : null);
     setNextInstruction(after ? { text: after.text } : null);
 
-    setCurrentSpeedMps(speedMps);
     setCurrentSpeedLimit(speedLimitAtIndex(navSpansRef.current, index));
 
     const totalLength = navTotalLengthRef.current;
@@ -2155,7 +2321,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const candidates = (currentInspectionStationsRef.current || [])
       .filter((station) => station.latitude != null && station.longitude != null)
       .filter((station) => {
-        const { index: stationIndex } = nearestPointIndex(points, station.latitude, station.longitude, 0, points.length - 1);
+        const { index: stationIndex } = matchToRoute(points, null, station.latitude, station.longitude, 0, points.length - 1);
         return stationIndex >= index - 3;
       })
       .map((station) => ({
@@ -2228,6 +2394,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     navCameraErrorsRef.current = 0;
     navFixCountRef.current = 0;
     navWatchdogRestartsRef.current = 0;
+    navRerouteCountRef.current = 0;
+    navRerouteStatusRef.current = '—';
+    navRouteRejectReasonRef.current = null;
+    navRouteDistanceRef.current = null;
 
     mapInstance.current.removeObjects(routeOptions.map((opt) => opt.polyline));
     // The route preview's plain start/end pins were previously left behind, so
@@ -2288,6 +2458,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     if (navPolylineRef.current) {
       mapInstance.current.removeObject(navPolylineRef.current);
       navPolylineRef.current = null;
+    }
+    if (navDebugProbeGroupRef.current) {
+      mapInstance.current.removeObject(navDebugProbeGroupRef.current);
+      navDebugProbeGroupRef.current = null;
     }
 
     clearTimeout(toastTimeoutRef.current);
@@ -2427,10 +2601,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 whiteSpace: 'pre',
                 fontFamily: 'JetBrains Mono, ui-monospace, monospace',
                 // Sized for legibility in a downscaled screen recording, not
-                // for looking good next to the rest of the UI.
-                fontSize: '17px',
+                // for looking good next to the rest of the UI. Dropped from
+                // 17px when the readout grew from 6 lines to 14 — at 17 the
+                // block ran past the bottom of a phone screen.
+                fontSize: '15px',
                 fontWeight: 700,
-                lineHeight: 1.3,
+                lineHeight: 1.25,
                 color: '#fff',
                 background: 'rgba(0,0,0,0.82)',
                 border: '3px solid #64748b',
