@@ -2899,45 +2899,69 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             )}
           </div>
 
-          <button
-            onClick={stopNavigation}
+          {/* Bottom dock: Stop Navigation sitting above the trip stats, laid
+              out as one flex column rather than two independently-positioned
+              absolute elements.
+
+              They used to be pinned separately — the panel at bottom 16px and
+              the button at a hardcoded bottom 96px, both at z-index 2500. That
+              96px was only ever true for a single-row panel. At 480px and
+              below, .mt-trip-stats wraps its four cells into a 2x2 grid and
+              roughly doubles in height, so the panel grew up through the
+              button and, being later in the DOM at an equal z-index, painted
+              over it. On a phone the button was almost entirely buried, which
+              is indistinguishable from it not existing.
+
+              Stacking them means the offset can't go stale: whatever height
+              the panel takes, the button sits above it. pointerEvents is off
+              on the container and back on for each child, so the gap between
+              them doesn't steal taps from the map. */}
+          <div
             style={{
               position: 'absolute',
-              bottom: 'calc(96px + env(safe-area-inset-bottom))',
-              left: '50%',
-              transform: 'translateX(-50%)',
+              left: '16px',
+              right: '16px',
+              bottom: 'calc(16px + env(safe-area-inset-bottom))',
               zIndex: 2500,
-              minHeight: '44px',
               display: 'flex',
+              flexDirection: 'column',
               alignItems: 'center',
-              justifyContent: 'center',
-              boxSizing: 'border-box',
-              padding: '14px 32px',
-              background: '#dc2626',
-              color: 'white',
-              border: 'none',
-              borderRadius: 0,
-              fontFamily: 'var(--font-display)',
-              textTransform: 'uppercase',
-              letterSpacing: '0.05em',
-              fontWeight: 700,
-              fontSize: '14px',
-              boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
-              cursor: 'pointer'
+              gap: '12px',
+              pointerEvents: 'none'
             }}
           >
-            Stop Navigation
-          </button>
+            <button
+              onClick={stopNavigation}
+              style={{
+                pointerEvents: 'auto',
+                minHeight: '44px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxSizing: 'border-box',
+                padding: '14px 32px',
+                background: '#dc2626',
+                color: 'white',
+                border: 'none',
+                borderRadius: 0,
+                fontFamily: 'var(--font-display)',
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+                fontWeight: 700,
+                fontSize: '14px',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+                cursor: 'pointer'
+              }}
+            >
+              Stop Navigation
+            </button>
 
-          {tripStats && (
+            {tripStats && (
             <div
               className="mt-trip-stats"
               style={{
-                position: 'absolute',
-                left: '16px',
-                right: '16px',
-                bottom: 'calc(16px + env(safe-area-inset-bottom))',
-                zIndex: 2500,
+                pointerEvents: 'auto',
+                alignSelf: 'stretch',
                 display: 'flex',
                 ...PANEL_STYLE,
                 borderRadius: 'var(--radius-soft)',
@@ -2976,7 +3000,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 </div>
               ))}
             </div>
-          )}
+            )}
+          </div>
 
           {showProfileModal && (
             <div
