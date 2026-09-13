@@ -5,6 +5,7 @@ import { getStationsNearRoute } from '../lib/inspectionStations';
 import { PROVINCE_PERMITS, getProvincesForBounds } from '../lib/provincePermits';
 import {
   bearingDegrees,
+  cameraHeadingForTravel,
   destPoint,
   deriveTargetHeading,
   haversineMeters,
@@ -1696,10 +1697,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       // vm:  read back from getLookAtData — the ViewModel's stored model.
       // DRW: measured off the rendered projection. The only one of these that
       //      says anything about what the driver is actually looking at.
+      // wnt: the direction of travel we want at the top of the screen.
+      // set: the camera azimuth actually handed to the SDK (wnt + 180 — see
+      //      cameraHeadingForTravel; they are supposed to differ).
+      // DRW: measured off the rendered projection, and should equal wnt.
       `HDG gps${padNum(stages.gps, 4)} drv${padNum(stages.derived, 4)}`,
-      `HDG smo${padNum(stages.smoothed, 4)} set${padNum(asked.heading, 4)}`,
-      `HDG vm ${padNum(model?.heading, 4)} DRW${padNum(drawn?.screenUpBearing, 4)}`,
-      `HDG err${padSigned(flags.headingErrorDeg, 4)} ${flags.heading ? 'OK  ' : 'FAIL'}`,
+      `HDG smo${padNum(stages.smoothed, 4)} wnt${padNum(asked.travel, 4)}`,
+      `HDG set${padNum(asked.heading, 4)} vm ${padNum(model?.heading, 4)}`,
+      `HDG DRW${padNum(drawn?.screenUpBearing, 4)} err${padSigned(flags.headingErrorDeg, 4)} ${flags.heading ? 'OK' : '!!'}`,
       `TLT set${padNum(asked.tilt, 4)} vm ${padNum(model?.tilt, 4)}`,
       // Ground metres above centre over ground metres below it. An untilted
       // orthographic view covers the same distance in both, so this pins at
@@ -1813,8 +1818,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // Rather than letting a bad heading through to the renderer, fall back to
     // north-up: a map that stops rotating is recoverable, a NaN camera is not.
     // The ?hdg= override pins the camera for the parked orientation test and
-    // is unreachable without ?debug=1.
-    const heading = navDebugHeadingOverride ?? (Number.isFinite(headingDeg) ? normalizeDegrees(headingDeg) : 0);
+    // is unreachable without ?debug=1. It pins the *travel* heading, upstream
+    // of the SDK conversion below, so the test still asks the same question.
+    const travelHeading = navDebugHeadingOverride ?? (Number.isFinite(headingDeg) ? normalizeDegrees(headingDeg) : 0);
+    // What we want at the top of the screen is the direction of travel; what
+    // the SDK wants is where the camera sits. See cameraHeadingForTravel.
+    const heading = cameraHeadingForTravel(travelHeading);
     const lookAt = { position: { lat, lng }, zoom: NAV_ZOOM, heading, tilt: NAV_TILT };
 
     try {
@@ -1830,11 +1839,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         const model = viewModel.getLookAtData();
         const drawn = measureRenderedCamera(mapInstance.current, { lat, lng });
 
-        // Judged against the rendered bearing, not the model's. Five degrees
-        // of slack because the probe measures a real projection over a finite
-        // pixel span; the failure this is looking for is 180, not 2.
+        // Judged against the rendered bearing, not the model's, and against
+        // the *travel* heading rather than the converted camera azimuth —
+        // "is the direction of travel at the top of the screen" is the
+        // question, and it stays the question whatever convention the SDK
+        // turns out to want. Five degrees of slack because the probe measures
+        // a real projection over a finite pixel span.
         const headingErrorDeg = drawn
-          ? shortestAngleDelta(heading, drawn.screenUpBearing)
+          ? shortestAngleDelta(travelHeading, drawn.screenUpBearing)
           : null;
         const flags = {
           headingErrorDeg,
@@ -1845,8 +1857,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           zoom: Math.abs((model?.zoom ?? 0) - NAV_ZOOM) < 0.5
         };
 
-        paintNavDebugOverlay({ heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, model, drawn, flags, now);
-        updateNavDebugProbes(mapInstance.current, { lat, lng }, heading);
+        paintNavDebugOverlay({ travel: travelHeading, heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, model, drawn, flags, now);
+        updateNavDebugProbes(mapInstance.current, { lat, lng }, travelHeading);
 
         navLogEvery('camera', 1000, () => ['camera set', {
           asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt: NAV_TILT },
@@ -2468,8 +2480,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     alertStateRef.current = new Map();
 
     // Back to a flat, north-up overview — the chase-camera heading/tilt only
-    // apply during active turn-by-turn navigation.
-    mapInstance.current.getViewModel().setLookAtData({ heading: 0, tilt: 0 });
+    // apply during active turn-by-turn navigation. Goes through the same
+    // conversion as the chase camera: a literal `heading: 0` renders south-up,
+    // which is how the overview was being left. Measured only at tilt 45, but
+    // the offset is a rotation convention and does not plausibly depend on
+    // tilt; worth a glance on the next drive when navigation ends.
+    mapInstance.current.getViewModel().setLookAtData({ heading: cameraHeadingForTravel(0), tilt: 0 });
 
     setNavigating(false);
     onNavigatingChange?.(false);

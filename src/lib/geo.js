@@ -60,6 +60,29 @@ export const destPoint = (origin, bearingDeg, meters) => {
   return { lat: toDeg(lat2), lng: normalizeDegrees(toDeg(lng2) + 180) - 180 };
 };
 
+// HERE's ILookAtData.heading is the azimuth from the look-at point *toward
+// the camera* — where the camera sits relative to the driver — not the
+// direction the camera faces. The SDK documents neither, and getLookAtData()
+// echoes back whatever was set, so nothing short of measuring the rendered
+// projection distinguishes the two conventions.
+//
+// Measured on-vehicle across eight samples spanning 0 to 178 degrees, at a
+// standstill with the heading pinned and at 112 km/h with it live: the
+// rendered screen-up bearing came back as the requested heading plus exactly
+// 180, every frame, with no dependence on speed, tilt or zoom.
+//
+//   requested   0  ->  drawn 180        requested 103  ->  drawn 283
+//   requested  90  ->  drawn 270        requested 178  ->  drawn 358
+//
+// A chase camera that wants the direction of travel at the top of the screen
+// therefore has to place the camera *behind* the driver, which is this
+// conversion. Nothing upstream of it is inverted — the bearing maths is the
+// textbook forward azimuth and is unit-tested as such. This is a unit
+// conversion at the SDK boundary, and it lives here, named, rather than being
+// folded into the heading pipeline where it would read as a sign error and
+// invite someone to "fix" it back.
+export const cameraHeadingForTravel = (travelHeadingDeg) => normalizeDegrees(travelHeadingDeg + 180);
+
 // Local equirectangular projection to metres, centred on `refLat`. Over the
 // hundreds of metres a single route segment spans, the error against a proper
 // geodesic is well under a metre — far below the 50m reroute threshold these

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bearingDegrees,
+  cameraHeadingForTravel,
   destPoint,
   deriveTargetHeading,
   haversineMeters,
@@ -83,6 +84,37 @@ describe('heading wraparound', () => {
 
   it('picks a consistent direction for an exact 180 reversal', () => {
     expect(Math.abs(shortestAngleDelta(0, 180))).toBeCloseTo(180);
+  });
+});
+
+describe('cameraHeadingForTravel', () => {
+  // Each pair is a measured on-vehicle sample: what was passed to
+  // setLookAtData, and the screen-up bearing the engine actually rendered.
+  // Feeding the converted value should now render the travel heading itself.
+  it.each([
+    [0, 180],
+    [90, 270],
+    [102, 282],
+    [103, 283],
+    [106, 286],
+    [108, 288],
+    [178, 358]
+  ])('places the camera behind a driver travelling %i degrees', (travel, expected) => {
+    expect(cameraHeadingForTravel(travel)).toBeCloseTo(expected, 6);
+  });
+
+  it('wraps rather than exceeding 360', () => {
+    expect(cameraHeadingForTravel(200)).toBeCloseTo(20);
+    expect(cameraHeadingForTravel(359)).toBeCloseTo(179);
+    expect(cameraHeadingForTravel(180)).toBeCloseTo(0);
+  });
+
+  // Applying it twice must return the original heading — the property that
+  // makes "is this the right way round" checkable without a vehicle.
+  it('is its own inverse', () => {
+    for (const h of [0, 37, 90, 180, 271, 359]) {
+      expect(cameraHeadingForTravel(cameraHeadingForTravel(h))).toBeCloseTo(h, 6);
+    }
   });
 });
 
