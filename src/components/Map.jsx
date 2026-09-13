@@ -1711,10 +1711,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       // 1.00 no matter what tilt the ViewModel claims to be holding.
       `TLT ratio ${ratio} ${flags.tiltDrawn ? 'OK  ' : 'FLAT'}`,
       `ZM  set${padNum(asked.zoom, 4)} vm ${padNum(model?.zoom, 4)} ${flags.zoom ? 'OK' : '!!'}`,
-      // Where the driver's own coordinates land on screen, in pixels from
-      // centre. This is "the truck walked off the top of the map" as a
-      // number: a camera that is tracking keeps both near zero.
-      `TRK dx${padSigned(drawn?.truckDx, 4)} dy${padSigned(drawn?.truckDy, 5)}`,
+      // Metres between the engine's own camera position and the driver, and
+      // the bearing of that gap relative to the direction of travel. This is
+      // "the truck is being left behind" as a number; rel near 0 means the
+      // camera is directly astern.
+      `CAM lag${padNum(flags.camLagM, 4)}m r${padSigned(flags.camLagRel, 4)} ${flags.camTracking ? 'OK' : '!!'}`,
       `RTE d${padNum(navRouteDistanceRef.current, 5)}m p${navRoutePointsRef.current?.length ?? 0}`,
       `OFF ${offRouteStreakRef.current}/${REROUTE_CONFIRM_FIXES}    OBJ ${objects ?? '—'}`,
       `RRT n${navRerouteCountRef.current} ${navRerouteStatusRef.current}`,
@@ -1726,7 +1727,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // driven by what was *drawn*, not by what the ViewModel echoed back —
     // the old version sat green through a drive where the map was pointing
     // the wrong way and had never been tilted.
-    box.style.borderColor = flags.heading && flags.tiltDrawn && flags.zoom ? '#22c55e' : '#ef4444';
+    box.style.borderColor =
+      flags.heading && flags.tiltDrawn && flags.zoom && flags.camTracking ? '#22c55e' : '#ef4444';
   };
 
   // Measures what the render engine actually drew, by round-tripping points
@@ -1741,7 +1743,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   //
   // Diagnostics are never allowed to be the thing that breaks navigation, so
   // every failure here returns null rather than propagating.
-  const measureRenderedCamera = (map, driverPos) => {
+  const measureRenderedCamera = (map) => {
     try {
       const viewPort = map.getViewPort();
       const width = viewPort?.width || mapRef.current?.clientWidth || 0;
@@ -1762,21 +1764,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       const metresAbove = haversineMeters(centre, above);
       const metresBelow = haversineMeters(centre, below);
 
-      let truckDx = null;
-      let truckDy = null;
-      if (driverPos) {
-        const screen = map.geoToScreen(driverPos);
-        if (screen && Number.isFinite(screen.x) && Number.isFinite(screen.y)) {
-          truckDx = screen.x - cx;
-          truckDy = screen.y - cy;
-        }
-      }
-
       return {
         screenUpBearing: bearingDegrees(centre, above),
-        tiltRatio: metresBelow > 0 ? metresAbove / metresBelow : null,
-        truckDx,
-        truckDy
+        tiltRatio: metresBelow > 0 ? metresAbove / metresBelow : null
       };
     } catch {
       return null;
@@ -1837,7 +1827,30 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       if (now - navCameraReadbackAtRef.current >= NAV_READBACK_MS) {
         navCameraReadbackAtRef.current = now;
         const model = viewModel.getLookAtData();
-        const drawn = measureRenderedCamera(mapInstance.current, { lat, lng });
+        const drawn = measureRenderedCamera(mapInstance.current);
+
+        // How far the camera actually is from the driver, in metres.
+        //
+        // getLookAtData returns the ViewModel's *current* camera, which after
+        // the engine's first synchronize() is written by the engine itself and
+        // not by our setLookAtData call — so unlike the previous probe this is
+        // an independent reading rather than a restatement of what we just
+        // asked for. (The old one compared geoToScreen(driverPos) against the
+        // viewport centre, which is the same coordinate round-tripped through
+        // the model that had just accepted it: it reported a perfectly centred
+        // truck through an entire drive where the truck was off the bottom of
+        // the screen.)
+        //
+        // `rel` is that lag bearing relative to the direction of travel: near
+        // 0 means the camera is directly behind the driver, which is what a
+        // camera failing to keep up looks like.
+        const camPos = model?.position;
+        const camLagM = camPos && Number.isFinite(camPos.lat) && Number.isFinite(camPos.lng)
+          ? haversineMeters(camPos, { lat, lng })
+          : null;
+        const camLagRel = camLagM != null && camLagM > 1
+          ? shortestAngleDelta(travelHeading, bearingDegrees(camPos, { lat, lng }))
+          : null;
 
         // Judged against the rendered bearing, not the model's, and against
         // the *travel* heading rather than the converted camera azimuth —
@@ -1854,7 +1867,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           // A flat orthographic render puts equal ground above and below
           // centre. NAV_TILT of 45 should push this comfortably past 1.2.
           tiltDrawn: Number.isFinite(drawn?.tiltRatio) && drawn.tiltRatio > 1.05,
-          zoom: Math.abs((model?.zoom ?? 0) - NAV_ZOOM) < 0.5
+          zoom: Math.abs((model?.zoom ?? 0) - NAV_ZOOM) < 0.5,
+          camLagM,
+          camLagRel,
+          // Half a screen at NAV_ZOOM is roughly 100m; past that the truck is
+          // visibly adrift even if it has not left the viewport yet.
+          camTracking: camLagM != null && camLagM < 25
         };
 
         paintNavDebugOverlay({ travel: travelHeading, heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, model, drawn, flags, now);
@@ -1874,8 +1892,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           drawn: {
             screenUpBearing: +fmt(drawn?.screenUpBearing),
             tiltRatio: +fmt(drawn?.tiltRatio, 3),
-            truckDx: +fmt(drawn?.truckDx, 0),
-            truckDy: +fmt(drawn?.truckDy, 0)
+            camLagM: +fmt(camLagM, 0),
+            camLagRel: +fmt(camLagRel, 0)
           },
           flags
         }]);
@@ -1893,6 +1911,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // carries a rotation of its own — the camera's heading rotates the entire
   // map, so the (unrotated, cached) truck icon is already pointing along the
   // direction of travel. See DRIVER_ICON_SVG.
+  //
+  // The camera is deliberately NOT driven from here. H.map.ViewModel keeps a
+  // target and a current camera, and setLookAtData only writes the current one
+  // until the render engine's first synchronize() call flips an internal flag
+  // — after which every setLookAtData is a new *target* the engine eases
+  // toward, and there is no documented way to make it jump. Re-targeting it
+  // sixty times a second while the vehicle moves therefore left the camera
+  // perpetually chasing a point it never reached, which is the truck sliding
+  // off the bottom of the screen. The camera is now set once per GPS fix, from
+  // handlePositionUpdate, and the engine's own easing does the smoothing
+  // between fixes — which is what that easing is for.
   const renderDriverPose = (lat, lng, headingDeg) => {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
     const pos = { lat, lng };
@@ -1903,7 +1932,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     } else {
       driverMarkerRef.current.setGeometry(pos);
     }
-    updateNavCamera(lat, lng, headingDeg);
     displayedPoseRef.current = { lat, lng, heading: Number.isFinite(headingDeg) ? headingDeg : 0 };
   };
 
@@ -2255,6 +2283,16 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       } catch (err) {
         console.error('[nav] first-fix render FAILED (readouts continue)', err);
       }
+    }
+
+    // Camera retargets once per fix, on the raw fix rather than the animated
+    // pose — see renderDriverPose for why it is not driven off the animation
+    // loop. Contained the same way the first-fix render is: a camera failure
+    // must not take the instruction and trip readouts below it down too.
+    try {
+      updateNavCamera(latitude, longitude, targetHeading);
+    } catch (err) {
+      console.error('[nav] camera update FAILED (readouts continue)', err);
     }
 
     if (!points || !points.length) return;
