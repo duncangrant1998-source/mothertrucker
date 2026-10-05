@@ -91,13 +91,12 @@ const REROUTE_SUCCESS_NOTICE_MS = 4000;
 // updates are frozen rather than fed to the marker/camera.
 const MIN_HEADING_SPEED_MPS = 5 / 3.6;
 
-// GPS fixes arrive in bursts roughly once a second; the marker/camera are
-// animated from their last rendered pose to each new fix over this long,
-// clamped so a delayed or back-to-back-fast fix can't produce a stalled or
-// instant-snap animation.
-const NAV_ANIM_MIN_MS = 300;
-const NAV_ANIM_MAX_MS = 2000;
-const NAV_ANIM_DEFAULT_MS = 1000;
+// GPS fixes arrive roughly once a second. Rather than animating from the last
+// rendered pose to each new fix over a fixed duration — which gets replaced
+// part-way by the next fix and so trails further behind the longer it runs —
+// the marker and camera exponentially approach the latest fix every frame with
+// this time constant. Steady-state lag is about TAU x speed: ~9m at 110 km/h.
+const NAV_FOLLOW_TAU_MS = 300;
 
 // If the animation loop hasn't ticked in this long while navigating is still
 // true, something outside the loop stopped it (a cancelled frame, a throw in
@@ -692,9 +691,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // — the animation's "from" anchor for the next leg, and what a mid-flight
   // new fix animates onward from instead of the fix's raw point.
   const displayedPoseRef = useRef(null);
-  // { fromLat, fromLng, fromHeading, toLat, toLng, toHeading, startTime,
-  //   duration, settled } for the requestAnimationFrame loop below.
-  const navAnimRef = useRef(null);
+  // { lat, lng, heading } — the latest GPS fix, which the loop below closes on
+  // a little more each frame.
+  const navTargetRef = useRef(null);
+  // performance.now() of the previous frame, for the follow step's dt.
+  const navLastStepAtRef = useRef(0);
   const navRafRef = useRef(null);
   // Loop health, reported by the diagnostics and by the watchdog. Counters
   // rather than booleans so a drive log shows whether a failure happened once
@@ -1951,29 +1952,43 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     navLastFrameAtRef.current = Date.now();
     navFrameCountRef.current += 1;
     try {
-      const anim = navAnimRef.current;
-      if (anim && !anim.settled) {
+      const target = navTargetRef.current;
+      const pose = displayedPoseRef.current;
+      if (target && pose) {
         const now = performance.now();
-        const t = anim.duration > 0 ? Math.min(1, (now - anim.startTime) / anim.duration) : 1;
-        const lat = anim.fromLat + (anim.toLat - anim.fromLat) * t;
-        const lng = anim.fromLng + (anim.toLng - anim.fromLng) * t;
-        const heading = normalizeDegrees(anim.fromHeading + shortestAngleDelta(anim.fromHeading, anim.toHeading) * t);
+        const dt = Math.min(100, Math.max(0, now - (navLastStepAtRef.current || now)));
+        navLastStepAtRef.current = now;
+        // Exponential approach rather than a fixed-duration lerp from a stale
+        // anchor: it converges on the target instead of being replaced
+        // part-way by the next fix, so the displayed pose cannot fall
+        // progressively further behind the truth. Lag is bounded at roughly
+        // TAU x speed — about 9m at 110 km/h, a fifth of the truck's own
+        // length on screen at NAV_ZOOM.
+        const k = 1 - Math.exp(-dt / NAV_FOLLOW_TAU_MS);
+        const lat = pose.lat + (target.lat - pose.lat) * k;
+        const lng = pose.lng + (target.lng - pose.lng) * k;
+        const heading = normalizeDegrees(pose.heading + shortestAngleDelta(pose.heading, target.heading) * k);
+        // Marker and camera are driven from the same pose on the same frame.
+        // They were briefly split — camera once per fix, marker per frame —
+        // which stopped the camera lagging but left the map stepping once a
+        // second in a single jump, measured as ~0.9s of zero movement
+        // followed by one frame of everything moving at once.
         renderDriverPose(lat, lng, heading);
-        if (t >= 1) anim.settled = true;
+        updateNavCamera(lat, lng, heading);
       }
       navLogEvery('frames', 5000, () => ['loop alive', {
         frames: navFrameCountRef.current,
         frameErrors: navFrameErrorsRef.current,
         cameraErrors: navCameraErrorsRef.current,
-        animating: Boolean(navAnimRef.current && !navAnimRef.current.settled)
+        following: Boolean(navTargetRef.current)
       }]);
     } catch (err) {
       navFrameErrorsRef.current += 1;
       console.error('[nav] stepNavAnimation frame FAILED (loop continues)', err);
-      // Retire the current animation so a poisoned one can't rethrow on every
-      // frame from here to the end of the trip; the next GPS fix installs a
-      // fresh one and tracking resumes on its own.
-      if (navAnimRef.current) navAnimRef.current.settled = true;
+      // Drop the target so a poisoned one can't rethrow on every frame from
+      // here to the end of the trip; the next GPS fix installs a fresh one
+      // and tracking resumes on its own.
+      navTargetRef.current = null;
     }
     navRafRef.current = requestAnimationFrame(stepNavAnimation);
   };
@@ -2256,22 +2271,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     });
 
     const isFirstFix = displayedPoseRef.current == null;
-    const fromPose = isFirstFix ? { lat: latitude, lng: longitude, heading: targetHeading } : displayedPoseRef.current;
-    const rawDuration = prevTimestamp ? position.timestamp - prevTimestamp : NAV_ANIM_DEFAULT_MS;
-    const duration = isFirstFix ? 0 : Math.min(NAV_ANIM_MAX_MS, Math.max(NAV_ANIM_MIN_MS, rawDuration || NAV_ANIM_DEFAULT_MS));
-    navAnimRef.current = {
-      fromLat: fromPose.lat,
-      fromLng: fromPose.lng,
-      fromHeading: fromPose.heading,
-      toLat: latitude,
-      toLng: longitude,
-      toHeading: targetHeading,
-      startTime: performance.now(),
-      duration,
-      settled: false
-    };
+    // The follow loop converges on this target every frame; it is not a
+    // fixed-duration animation with a start anchor, so there is nothing here
+    // to restart or to fall behind.
+    navTargetRef.current = { lat: latitude, lng: longitude, heading: targetHeading };
     if (isFirstFix) {
-      // Nothing rendered yet to animate from — paint the first fix immediately.
+      // Nothing rendered yet to follow from — paint the first fix immediately.
       // Contained: this used to sit directly in the handler's path, so a throw
       // in the camera meant every `setCurrentInstruction`/`setTripStats` call
       // below was skipped too. That is the mechanism behind a distance readout
@@ -2280,19 +2285,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       // also kept `isFirstFix` true, so it recurred on every single fix.
       try {
         renderDriverPose(latitude, longitude, targetHeading);
+        updateNavCamera(latitude, longitude, targetHeading);
       } catch (err) {
         console.error('[nav] first-fix render FAILED (readouts continue)', err);
       }
-    }
-
-    // Camera retargets once per fix, on the raw fix rather than the animated
-    // pose — see renderDriverPose for why it is not driven off the animation
-    // loop. Contained the same way the first-fix render is: a camera failure
-    // must not take the instruction and trip readouts below it down too.
-    try {
-      updateNavCamera(latitude, longitude, targetHeading);
-    } catch (err) {
-      console.error('[nav] camera update FAILED (readouts continue)', err);
     }
 
     if (!points || !points.length) return;
@@ -2434,7 +2430,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     lastFixTimestampRef.current = null;
     smoothedHeadingRef.current = null;
     displayedPoseRef.current = null;
-    navAnimRef.current = null;
+    navTargetRef.current = null;
+    navLastStepAtRef.current = 0;
     recalculatingRef.current = false;
     offRouteStreakRef.current = 0;
     lastRerouteAttemptRef.current = 0;
@@ -2499,7 +2496,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       cameraErrors: navCameraErrorsRef.current,
       watchdogRestarts: navWatchdogRestartsRef.current
     });
-    navAnimRef.current = null;
+    navTargetRef.current = null;
+    navLastStepAtRef.current = 0;
     displayedPoseRef.current = null;
     if (driverMarkerRef.current) {
       mapInstance.current.removeObject(driverMarkerRef.current);

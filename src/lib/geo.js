@@ -128,6 +128,12 @@ export const buildCumulativeDistances = (points) => {
   return cumulative;
 };
 
+// Above this distance from the route, a windowed match is treated as
+// suspicious rather than as fact, and re-checked against the whole polyline.
+// Deliberately below the caller's reroute trigger so the re-check always
+// happens before a reroute can be confirmed.
+const OFF_ROUTE_SANITY_METERS = 30;
+
 // Matches a GPS fix onto the route polyline.
 //
 // Searches a window around `fromIndex` (the driver's last known position on
@@ -159,15 +165,42 @@ export const matchToRoute = (points, cumulative, lat, lng, fromIndex = 0, window
     };
   }
 
-  let bestIndex = start;
-  let bestDistance = Infinity;
-  let bestT = 0;
-  for (let i = start; i < end; i++) {
-    const { distance, t } = pointToSegment(p, points[i], points[i + 1]);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestIndex = i;
-      bestT = t;
+  const search = (from, to) => {
+    let bi = from;
+    let bd = Infinity;
+    let bt = 0;
+    for (let i = from; i < to; i++) {
+      const { distance, t } = pointToSegment(p, points[i], points[i + 1]);
+      if (distance < bd) {
+        bd = distance;
+        bi = i;
+        bt = t;
+      }
+    }
+    return { bi, bd, bt };
+  };
+
+  let { bi: bestIndex, bd: bestDistance, bt: bestT } = search(start, end);
+
+  // A windowed search is sticky in one direction: it only looks five vertices
+  // behind, so once the match snaps forward it cannot come back. That is
+  // exactly what a motorway on-ramp does to it — the mainline runs parallel a
+  // few tens of metres away and is *ahead* in the route, so one fix can match
+  // the mainline instead of the ramp the vehicle is actually on. The window
+  // then starts past the ramp entirely, every following fix reads a large
+  // distance, and three of them fire a reroute on a vehicle that never left
+  // its route. The reroute "fixes" it only because a fresh route resets the
+  // index to zero, which is why it looks like the app changes its mind.
+  //
+  // So when the windowed answer looks off-route, fall back to searching the
+  // whole polyline before believing it. O(n) on a few hundred to a few
+  // thousand points, and only on the rare fix that already looks bad.
+  if (bestDistance > OFF_ROUTE_SANITY_METERS && points.length > 2) {
+    const full = search(0, points.length - 1);
+    if (full.bd < bestDistance) {
+      bestIndex = full.bi;
+      bestDistance = full.bd;
+      bestT = full.bt;
     }
   }
 

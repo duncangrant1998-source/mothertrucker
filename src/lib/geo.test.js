@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bearingDegrees,
+  buildCumulativeDistances,
   cameraHeadingForTravel,
   destPoint,
   deriveTargetHeading,
@@ -197,6 +198,38 @@ describe('matchToRoute', () => {
       expect(travelled).toBeGreaterThan(previous);
       previous = travelled;
     }
+  });
+
+  // The on-ramp case. The route runs up a ramp and then joins a motorway that
+  // doubles back alongside it, so mainline vertices sit a few tens of metres
+  // from the ramp and are *ahead* in the route. One fix matching the mainline
+  // used to push the search window past the ramp permanently: with only five
+  // vertices of backward slack it could never return, so every later fix on
+  // the ramp read as far off-route and three of them fired a reroute.
+  it('recovers when the window has snapped onto a parallel road ahead', () => {
+    const ramp = [];
+    for (let i = 0; i <= 20; i++) ramp.push({ lat: 43.2000 + i * 0.00018, lng: -79.6000 });
+    const mainline = [];
+    for (let i = 0; i <= 20; i++) mainline.push({ lat: 43.2036 - i * 0.00018, lng: -79.59955 });
+    const points = [...ramp, ...mainline];
+    const cumulative = buildCumulativeDistances(points);
+
+    // Vehicle sitting exactly on the ramp, a third of the way up.
+    const onRamp = { lat: 43.2012, lng: -79.6000 };
+    // ...but the last match snapped forward onto the mainline.
+    const snappedIndex = 30;
+
+    const { distance, index } = matchToRoute(
+      points, cumulative, onRamp.lat, onRamp.lng, snappedIndex, 80
+    );
+    expect(distance).toBeLessThan(5);
+    expect(index).toBeLessThan(ramp.length);
+  });
+
+  it('does not run the full-polyline fallback when the window already fits', () => {
+    const near = { lat: 43.2000, lng: -79.5914 };
+    const { distance } = matchToRoute(SPARSE_HIGHWAY, [0, 1393.9, 2787.8], near.lat, near.lng, 0);
+    expect(distance).toBeLessThan(5);
   });
 
   it('handles a single-vertex route without dividing by zero', () => {
