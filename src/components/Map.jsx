@@ -866,6 +866,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         }
       });
 
+      // Materialise the object layer now, while the stack holds nothing but
+      // the base layer, so it is deterministically the topmost layer for the
+      // life of the map. getObjects() runs the same lazy init as addObject
+      // (`!this.Ha && Bi(this)`), so this one call is enough. Belt and braces
+      // alongside the indexed addLayer below: that keeps overlays underneath,
+      // this keeps objects on top, and neither depends on call order.
+      map.getObjects();
+
       mapInstance.current = map;
       platformRef.current = platform;
       uiRef.current = ui;
@@ -938,7 +946,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     }
     if (hybridOverlayLayerRef.current !== overlayLayer) {
       if (hybridOverlayLayerRef.current) map.removeLayer(hybridOverlayLayerRef.current);
-      if (overlayLayer) map.addLayer(overlayLayer);
+      // Index 1 — directly above the base layer — and never the default,
+      // which is the top of the stack.
+      //
+      // H.Map keeps route polylines and markers in an object layer that is
+      // created lazily, on the first addObject (`!this.Ha && Bi(this)` in
+      // mapsjs-core), and appended wherever the stack happens to end at that
+      // moment. addLayer without an index appends to the top. So if satellite's
+      // hybrid overlay is added *after* the first object exists — which is what
+      // switching to satellite, or changing colour scheme, part-way through a
+      // drive does — the overlay lands on top of the object layer and paints
+      // over the route and the truck. Both simply disappear, with the base
+      // imagery and the camera still working perfectly, which is what it looked
+      // like on the truck. Topo has no overlay, so it was never affected.
+      if (overlayLayer) map.addLayer(overlayLayer, 1);
       hybridOverlayLayerRef.current = overlayLayer;
     }
   }, [mapLayer, colorScheme]);
