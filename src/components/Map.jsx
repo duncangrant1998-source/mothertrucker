@@ -97,6 +97,12 @@ const MIN_HEADING_SPEED_MPS = 5 / 3.6;
 // the marker and camera exponentially approach the latest fix every frame with
 // this time constant. Steady-state lag is about TAU x speed: ~9m at 110 km/h.
 const NAV_FOLLOW_TAU_MS = 300;
+// Below these, the follow loop leaves the scene alone entirely rather than
+// reissuing a camera and marker update the viewer could not see anyway. The
+// point is to give the renderer idle frames in which to finish drawing the
+// object layer — see the dead band in stepNavAnimation.
+const NAV_FOLLOW_MIN_MOVE_M = 0.25;
+const NAV_FOLLOW_MIN_TURN_DEG = 0.2;
 
 // If the animation loop hasn't ticked in this long while navigating is still
 // true, something outside the loop stopped it (a cancelled frame, a throw in
@@ -177,6 +183,24 @@ const navDebugHeadingOverride = (() => {
     if (raw == null) return null;
     const value = Number(raw);
     return Number.isFinite(value) ? normalizeDegrees(value) : null;
+  } catch {
+    return null;
+  }
+})();
+
+// TEMPORARY — camera tilt override, for isolating the other candidate behind
+// the vanishing route line and truck: that HARP will not draw map objects
+// under a tilted camera. The preview screen is flat and draws its polylines;
+// navigation tilts to NAV_TILT and draws nothing.
+//   ?debug=1&tilt=0    flat chase camera, everything else unchanged
+// Clamped to the 0-70 HARP accepts. Only readable with ?debug=1.
+const navDebugTiltOverride = (() => {
+  if (!navDebugOverlayEnabled) return null;
+  try {
+    const raw = new URLSearchParams(window.location.search).get('tilt');
+    if (raw == null) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? Math.max(0, Math.min(70, value)) : null;
   } catch {
     return null;
   }
@@ -1973,7 +1997,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // What we want at the top of the screen is the direction of travel; what
     // the SDK wants is where the camera sits. See cameraHeadingForTravel.
     const heading = cameraHeadingForTravel(travelHeading);
-    const lookAt = { position: { lat, lng }, zoom: NAV_ZOOM, heading, tilt: NAV_TILT };
+    const tilt = navDebugTiltOverride ?? NAV_TILT;
+    const lookAt = { position: { lat, lng }, zoom: NAV_ZOOM, heading, tilt };
 
     try {
       const viewModel = mapInstance.current.getViewModel();
@@ -2025,7 +2050,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           heading: Number.isFinite(headingErrorDeg) && Math.abs(headingErrorDeg) < 5,
           // A flat orthographic render puts equal ground above and below
           // centre. NAV_TILT of 45 should push this comfortably past 1.2.
-          tiltDrawn: Number.isFinite(drawn?.tiltRatio) && drawn.tiltRatio > 1.05,
+          // A deliberately flat camera (?tilt=0) should read ~1.00, so the
+          // flag follows what was asked for rather than always demanding tilt.
+          tiltDrawn: tilt < 1
+            ? Number.isFinite(drawn?.tiltRatio)
+            : Number.isFinite(drawn?.tiltRatio) && drawn.tiltRatio > 1.05,
           zoom: Math.abs((model?.zoom ?? 0) - NAV_ZOOM) < 0.5,
           camLagM,
           camLagRel,
@@ -2034,11 +2063,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           camTracking: camLagM != null && camLagM < 25
         };
 
-        paintNavDebugOverlay({ travel: travelHeading, heading, tilt: NAV_TILT, zoom: NAV_ZOOM }, model, drawn, flags, now);
+        paintNavDebugOverlay({ travel: travelHeading, heading, tilt, zoom: NAV_ZOOM }, model, drawn, flags, now);
         updateNavDebugProbes(mapInstance.current, { lat, lng }, travelHeading);
 
         navLogEvery('camera', 1000, () => ['camera set', {
-          asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt: NAV_TILT },
+          asked: { lat: +fmt(lat, 5), lng: +fmt(lng, 5), heading: +fmt(heading), zoom: NAV_ZOOM, tilt },
           model: {
             lat: +fmt(model?.position?.lat, 5),
             lng: +fmt(model?.position?.lng, 5),
@@ -2126,13 +2155,33 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         const lat = pose.lat + (target.lat - pose.lat) * k;
         const lng = pose.lng + (target.lng - pose.lng) * k;
         const heading = normalizeDegrees(pose.heading + shortestAngleDelta(pose.heading, target.heading) * k);
-        // Marker and camera are driven from the same pose on the same frame.
-        // They were briefly split — camera once per fix, marker per frame —
-        // which stopped the camera lagging but left the map stepping once a
-        // second in a single jump, measured as ~0.9s of zero movement
-        // followed by one frame of everything moving at once.
-        renderDriverPose(lat, lng, heading);
-        updateNavCamera(lat, lng, heading);
+
+        // Dead band. An exponential approach is asymptotic: it never actually
+        // arrives, so without this the loop reissues setLookAtData and
+        // setGeometry sixty times a second forever — including parked on a
+        // driveway with the target not moving at all.
+        //
+        // That starves the renderer. Base tiles are cached and composite every
+        // frame regardless, but the object layer has to re-rasterise, and it
+        // never got an idle frame in which to finish: route line and truck
+        // both vanished the moment navigation started, while the preview
+        // screen — static camera — drew its polylines perfectly. The old
+        // fixed-duration lerp settled between fixes and the once-per-fix
+        // camera moved once a second; both left gaps, and both rendered.
+        //
+        // Below a quarter metre and a fifth of a degree nothing is visible on
+        // screen anyway at NAV_ZOOM, so stopping there costs no smoothness.
+        const moved = haversineMeters(pose, { lat, lng });
+        const turned = Math.abs(shortestAngleDelta(pose.heading, heading));
+        if (moved >= NAV_FOLLOW_MIN_MOVE_M || turned >= NAV_FOLLOW_MIN_TURN_DEG) {
+          // Marker and camera are driven from the same pose on the same frame.
+          // They were briefly split — camera once per fix, marker per frame —
+          // which stopped the camera lagging but left the map stepping once a
+          // second in a single jump, measured as ~0.9s of zero movement
+          // followed by one frame of everything moving at once.
+          renderDriverPose(lat, lng, heading);
+          updateNavCamera(lat, lng, heading);
+        }
       }
       navLogEvery('frames', 5000, () => ['loop alive', {
         frames: navFrameCountRef.current,
