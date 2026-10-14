@@ -880,6 +880,68 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     }
   }, []);
 
+  // TEMPORARY — map-state readout, ?debug=1 only.
+  //
+  // "No route line and no truck, no errors" has two completely different
+  // causes and they need opposite fixes: the objects are never added, or they
+  // are added and not drawn. Nothing on screen distinguishes them, and three
+  // rounds of reasoning from the SDK source guessed wrong. This prints the one
+  // number that settles it.
+  //
+  // Deliberately outside the navigating gate and written straight to the DOM,
+  // so it reports during route preview as well as during turn-by-turn, and
+  // keeps working if the React tree below it fails. Delete with the rest of
+  // the ?debug=1 instrumentation.
+  useEffect(() => {
+    if (!navDebugOverlayEnabled) return undefined;
+    const el = document.createElement('div');
+    el.setAttribute('data-debug-mapstate', '');
+    Object.assign(el.style, {
+      position: 'fixed',
+      left: '0',
+      bottom: '0',
+      zIndex: '2147483646',
+      pointerEvents: 'none',
+      background: 'rgba(0,0,0,0.85)',
+      color: '#7CFC9A',
+      font: '700 13px/1.3 "JetBrains Mono", ui-monospace, monospace',
+      padding: '4px 7px',
+      whiteSpace: 'pre'
+    });
+    document.body.appendChild(el);
+
+    const tick = () => {
+      const map = mapInstance.current;
+      if (!map) {
+        el.textContent = 'MAP null';
+        return;
+      }
+      let objects = -1;
+      let layers = -1;
+      try {
+        objects = map.getObjects().length;
+      } catch {
+        objects = -2;
+      }
+      try {
+        const list = map.getLayers();
+        layers = list?.getLength?.() ?? list?.asArray?.().length ?? -1;
+      } catch {
+        layers = -2;
+      }
+      el.textContent =
+        `OBJ ${objects}  LYR ${layers}  ` +
+        `POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0}`;
+    };
+
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => {
+      clearInterval(id);
+      el.remove();
+    };
+  }, []);
+
   // HERE sizes its canvas and projection once at construction and does not
   // observe the container afterwards — H.map.ViewPort#resize() has to be
   // called by hand whenever the element's box changes. Nothing did.
