@@ -953,15 +953,43 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         // leave as -1
       }
 
-      // Is the route geometry even inside the current view? A polyline with
-      // valid coordinates that the camera is not looking at draws nothing and
-      // looks identical to a renderer fault.
+      // Is anything on the map inside the current view? Valid geometry the
+      // camera is not pointed at draws nothing and is indistinguishable from
+      // a renderer fault from the driver's seat.
+      //
+      // Measured across every object rather than just the navigation polyline,
+      // which does not exist during route preview — the first version of this
+      // could only ever print '?' before navigation started, which is exactly
+      // when it was asked for.
       let inView = '?';
+      let tally = '';
       try {
-        const poly = navPolylineRef.current;
+        const objs = map.getObjects();
+        let polylines = 0;
+        let markers = 0;
+        let other = 0;
+        objs.forEach((o) => {
+          if (o instanceof H.map.Polyline) polylines += 1;
+          else if (o instanceof H.map.Marker) markers += 1;
+          else other += 1;
+        });
+        tally = `P${polylines} M${markers} X${other}`;
+
         const bounds = map.getViewModel().getLookAtData()?.bounds;
-        if (poly && bounds) {
-          inView = bounds.intersects(poly.getBoundingBox()) ? 'y' : 'N';
+        if (objs.length && bounds) {
+          const hit = objs.some((o) => {
+            try {
+              if (typeof o.getBoundingBox === 'function') {
+                const bb = o.getBoundingBox();
+                return bb ? bounds.intersects(bb) : false;
+              }
+              const g = o.getGeometry?.();
+              return g ? bounds.containsPoint(g) : false;
+            } catch {
+              return false;
+            }
+          });
+          inView = hit ? 'y' : 'N';
         }
       } catch {
         inView = 'E';
@@ -976,9 +1004,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
       const n = (v) => (v < 0 ? '-' : String(v));
       el.textContent =
-        `OBJ ${objects}  LYR ${layerArr.length}  ZM ${zoom}\n` +
-        `BASE ${n(baseIdx)} OVL ${n(ovlIdx)} OBJL ${n(objIdx)}\n` +
-        `POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0} VIEW ${inView}`;
+        `OBJ ${objects} ${tally}\n` +
+        `LYR ${layerArr.length} BASE ${n(baseIdx)} OVL ${n(ovlIdx)} OBJL ${n(objIdx)}\n` +
+        `ZM ${zoom} POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0} VIEW ${inView}`;
     };
 
     tick();
