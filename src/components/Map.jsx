@@ -977,46 +977,52 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         // leave as -1
       }
 
-      // Is anything on the map inside the current view? Valid geometry the
-      // camera is not pointed at draws nothing and is indistinguishable from
-      // a renderer fault from the driver's seat.
-      //
-      // Measured across every object rather than just the navigation polyline,
-      // which does not exist during route preview — the first version of this
-      // could only ever print '?' before navigation started, which is exactly
-      // when it was asked for.
-      let inView = '?';
       let tally = '';
       try {
-        const objs = map.getObjects();
         let polylines = 0;
         let markers = 0;
         let other = 0;
-        objs.forEach((o) => {
+        map.getObjects().forEach((o) => {
           if (o instanceof H.map.Polyline) polylines += 1;
           else if (o instanceof H.map.Marker) markers += 1;
           else other += 1;
         });
         tally = `P${polylines} M${markers} X${other}`;
+      } catch {
+        tally = 'P? M? X?';
+      }
 
-        const bounds = map.getViewModel().getLookAtData()?.bounds;
-        if (objs.length && bounds) {
-          const hit = objs.some((o) => {
-            try {
-              if (typeof o.getBoundingBox === 'function') {
-                const bb = o.getBoundingBox();
-                return bb ? bounds.intersects(bb) : false;
-              }
-              const g = o.getGeometry?.();
-              return g ? bounds.containsPoint(g) : false;
-            } catch {
-              return false;
-            }
-          });
-          inView = hit ? 'y' : 'N';
+      // The route line draws and the truck does not, and both are objects in
+      // the same layer — so the difference is the one thing that is not shared.
+      // A polyline is vector and draws immediately; a marker draws through an
+      // H.map.Icon built from an SVG string, which has to decode to a bitmap
+      // asynchronously first. An icon stuck below READY, or in ERROR, is a
+      // marker that is present, positioned, on top and completely invisible.
+      //
+      // (The previous VIEW check is gone. It read bounds off the ViewModel and
+      // reported N for a preview polyline that was plainly on screen, so it
+      // was misinformation rather than a measurement.)
+      // H.map.Icon.State is { ERROR: -1, LOADING: 0, READY: 1 }.
+      let iconState = '-';
+      try {
+        const st = driverMarkerRef.current?.getIcon?.()?.getState?.();
+        iconState = st == null ? '-' : ({ '-1': 'ERR', 0: 'LOAD', 1: 'READY' }[st] ?? String(st));
+      } catch {
+        iconState = 'E';
+      }
+
+      // Where the truck marker actually projects to, in screen pixels. A
+      // marker parked off the edge of the viewport looks identical to one that
+      // never drew.
+      let markerAt = '-';
+      try {
+        const g = driverMarkerRef.current?.getGeometry?.();
+        if (g) {
+          const s = map.geoToScreen(g);
+          markerAt = s ? `${Math.round(s.x)},${Math.round(s.y)}` : 'null';
         }
       } catch {
-        inView = 'E';
+        markerAt = 'E';
       }
 
       let zoom = '--';
@@ -1030,7 +1036,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       el.textContent =
         `OBJ ${objects} ${tally}\n` +
         `LYR ${layerArr.length} BASE ${n(baseIdx)} OVL ${n(ovlIdx)} OBJL ${n(objIdx)}\n` +
-        `ZM ${zoom} POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0} VIEW ${inView}`;
+        `ZM ${zoom} POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0}\n` +
+        `ICON ${iconState} AT ${markerAt}`;
     };
 
     tick();
@@ -2173,7 +2180,27 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         // screen anyway at NAV_ZOOM, so stopping there costs no smoothness.
         const moved = haversineMeters(pose, { lat, lng });
         const turned = Math.abs(shortestAngleDelta(pose.heading, heading));
-        if (moved >= NAV_FOLLOW_MIN_MOVE_M || turned >= NAV_FOLLOW_MIN_TURN_DEG) {
+
+        // The dead band must not start before the truck is drawable. An
+        // H.map.Icon built from an SVG string decodes to a bitmap
+        // asynchronously, and the marker is created on the first fix — by
+        // which time the camera converges within a few frames, the dead band
+        // engages, and nothing invalidates the layer again. The icon then
+        // finishes decoding into a scene that is never redrawn, so the route
+        // line (vector, drawn immediately) appears and the truck never does.
+        //
+        // Only LOADING holds the loop open. ERROR counts as settled, otherwise
+        // an icon that can never decode would pin the loop at 60fps forever and
+        // reintroduce exactly the starvation the dead band exists to prevent.
+        let iconLoading = false;
+        try {
+          const loadingState = H.map.Icon.State?.LOADING ?? 0;
+          iconLoading = driverMarkerRef.current?.getIcon?.()?.getState?.() === loadingState;
+        } catch {
+          iconLoading = false;
+        }
+
+        if (iconLoading || moved >= NAV_FOLLOW_MIN_MOVE_M || turned >= NAV_FOLLOW_MIN_TURN_DEG) {
           // Marker and camera are driven from the same pose on the same frame.
           // They were briefly split — camera once per fix, marker per frame —
           // which stopped the camera lagging but left the map stepping once a
