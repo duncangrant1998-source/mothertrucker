@@ -917,21 +917,68 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         return;
       }
       let objects = -1;
-      let layers = -1;
       try {
         objects = map.getObjects().length;
       } catch {
         objects = -2;
       }
+
+      // Layer composition. The object layer has no public handle, so it is
+      // identified by elimination: whatever is neither the base layer nor the
+      // hybrid overlay we added. If it is missing from this list entirely,
+      // that is the answer — objects would be held by a provider attached to
+      // nothing, which is exactly "OBJ 5 and a blank map".
+      let layerArr = [];
       try {
         const list = map.getLayers();
-        layers = list?.getLength?.() ?? list?.asArray?.().length ?? -1;
+        layerArr = list?.asArray?.() ?? [];
+        if (!layerArr.length && list?.getLength) {
+          const n = list.getLength();
+          for (let i = 0; i < n; i++) layerArr.push(list.get(i));
+        }
       } catch {
-        layers = -2;
+        layerArr = [];
       }
+      let baseIdx = -1;
+      let ovlIdx = -1;
+      let objIdx = -1;
+      try {
+        const base = map.getBaseLayer();
+        layerArr.forEach((layer, i) => {
+          if (layer === base) baseIdx = i;
+          else if (layer === hybridOverlayLayerRef.current) ovlIdx = i;
+          else if (objIdx < 0) objIdx = i;
+        });
+      } catch {
+        // leave as -1
+      }
+
+      // Is the route geometry even inside the current view? A polyline with
+      // valid coordinates that the camera is not looking at draws nothing and
+      // looks identical to a renderer fault.
+      let inView = '?';
+      try {
+        const poly = navPolylineRef.current;
+        const bounds = map.getViewModel().getLookAtData()?.bounds;
+        if (poly && bounds) {
+          inView = bounds.intersects(poly.getBoundingBox()) ? 'y' : 'N';
+        }
+      } catch {
+        inView = 'E';
+      }
+
+      let zoom = '--';
+      try {
+        zoom = String(Math.round(map.getViewModel().getLookAtData()?.zoom ?? -1));
+      } catch {
+        zoom = 'E';
+      }
+
+      const n = (v) => (v < 0 ? '-' : String(v));
       el.textContent =
-        `OBJ ${objects}  LYR ${layers}  ` +
-        `POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0}`;
+        `OBJ ${objects}  LYR ${layerArr.length}  ZM ${zoom}\n` +
+        `BASE ${n(baseIdx)} OVL ${n(ovlIdx)} OBJL ${n(objIdx)}\n` +
+        `POLY ${navPolylineRef.current ? 1 : 0} MRK ${driverMarkerRef.current ? 1 : 0} VIEW ${inView}`;
     };
 
     tick();
