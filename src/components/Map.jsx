@@ -835,6 +835,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       new H.mapevents.Behavior(new H.mapevents.MapEvents(map));
       const ui = H.ui.UI.createDefault(map, defaultLayers);
 
+      // Published before the rest of the setup below, not after it. These refs
+      // are what every other feature reaches the map through — routing, the
+      // layer swap, navigation, every marker — so anything that throws between
+      // construction and this point takes the entire app down while leaving a
+      // perfectly good map rendering tiles on screen, which reads as "the route
+      // won't generate" rather than as an error. That is precisely what a
+      // stray map.getObjects() added here did.
+      mapInstance.current = map;
+      platformRef.current = platform;
+      uiRef.current = ui;
+
       // Move the layer swatch, zoom buttons, and scale bar to bottom-left so
       // they stay clear of the trip stats panel docked bottom-right.
       ['mapsettings', 'zoom', 'scalebar'].forEach((controlName) => {
@@ -866,17 +877,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         }
       });
 
-      // Materialise the object layer now, while the stack holds nothing but
-      // the base layer, so it is deterministically the topmost layer for the
-      // life of the map. getObjects() runs the same lazy init as addObject
-      // (`!this.Ha && Bi(this)`), so this one call is enough. Belt and braces
-      // alongside the indexed addLayer below: that keeps overlays underneath,
-      // this keeps objects on top, and neither depends on call order.
-      map.getObjects();
-
-      mapInstance.current = map;
-      platformRef.current = platform;
-      uiRef.current = ui;
     }
   }, []);
 
