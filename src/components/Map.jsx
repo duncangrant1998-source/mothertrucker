@@ -857,6 +857,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const routeCardCanAutoCollapseRef = useRef(true);
   // Area Regulations (province permit cards) start closed; the pill toggles them.
   const [permitPanelOpen, setPermitPanelOpen] = useState(false);
+  // True once the driver has dragged the map away from the truck during
+  // navigation. The follow loop then stops re-centring the camera (it would
+  // snap straight back on the next frame) until Recenter is pressed. The ref
+  // is what the map's drag listener and the animation loop read, since both
+  // are set up once and would close over a stale state value.
+  const [navDetached, setNavDetached] = useState(false);
+  const navDetachedRef = useRef(false);
+  const navActiveRef = useRef(false);
 
   const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
 
@@ -941,6 +949,14 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         if (routeCardCanAutoCollapseRef.current) {
           setRouteCardCollapsed(true);
         }
+      });
+
+      // A user drag during navigation detaches the camera from the truck so
+      // the Recenter button can offer to bring it back.
+      map.addEventListener('dragstart', () => {
+        if (!navActiveRef.current || navDetachedRef.current) return;
+        navDetachedRef.current = true;
+        setNavDetached(true);
       });
 
     }
@@ -2268,7 +2284,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           // second in a single jump, measured as ~0.9s of zero movement
           // followed by one frame of everything moving at once.
           renderDriverPose(lat, lng, heading);
-          updateNavCamera(lat, lng, heading);
+          // Left alone while the driver has panned away; the truck marker above
+          // keeps moving so they can see where it is.
+          if (!navDetachedRef.current) updateNavCamera(lat, lng, heading);
         }
       }
       navLogEvery('frames', 5000, () => ['loop alive', {
@@ -2773,6 +2791,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       routeEndpointMarkersRef.current = [];
     }
     applyNavRoute(selected.section);
+    navActiveRef.current = true;
+    navDetachedRef.current = false;
+    setNavDetached(false);
     setNavigating(true);
     onNavigatingChange?.(true);
 
@@ -2796,7 +2817,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     startNavAnimationLoop();
   };
 
+  // Hands the camera back to the follow loop and snaps it to the truck now,
+  // at the navigation zoom/heading/tilt (the engine eases there).
+  const recenterNavCamera = () => {
+    navDetachedRef.current = false;
+    setNavDetached(false);
+    const pose = displayedPoseRef.current;
+    if (pose) updateNavCamera(pose.lat, pose.lng, pose.heading);
+  };
+
   const stopNavigation = () => {
+    navActiveRef.current = false;
+    navDetachedRef.current = false;
+    setNavDetached(false);
     if (watchIdRef.current != null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
@@ -3108,6 +3141,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                         MTO Contact Info
                       </button>
                       <button
+                        onClick={() => { setOptionsMenuOpen(false); stopNavigation(); }}
+                        style={{ ...MENU_ITEM_STYLE, color: '#dc2626', fontWeight: 700 }}
+                      >
+                        End Route
+                      </button>
+                      <button
                         onClick={() => setSpeedUnitMenuOpen((open) => !open)}
                         style={{ ...MENU_ITEM_STYLE, borderBottom: speedUnitMenuOpen ? '1px solid var(--color-border)' : 'none' }}
                       >
@@ -3268,7 +3307,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             )}
           </div>
 
-          {/* Bottom dock: Stop Navigation sitting above the trip stats, laid
+          {/* Bottom dock: the Recenter button (shown only after panning away
+              from the truck) sitting above the trip stats, laid
               out as one flex column rather than two independently-positioned
               absolute elements.
 
@@ -3299,31 +3339,34 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               pointerEvents: 'none'
             }}
           >
-            <button
-              onClick={stopNavigation}
-              style={{
-                pointerEvents: 'auto',
-                minHeight: '44px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                boxSizing: 'border-box',
-                padding: '14px 32px',
-                background: '#dc2626',
-                color: 'white',
-                border: 'none',
-                borderRadius: 'var(--radius-soft)',
-                fontFamily: 'var(--font-display)',
-                textTransform: 'uppercase',
-                letterSpacing: '0.05em',
-                fontWeight: 700,
-                fontSize: '14px',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
-                cursor: 'pointer'
-              }}
-            >
-              Stop Navigation
-            </button>
+            {navDetached && (
+              <button
+                onClick={recenterNavCamera}
+                style={{
+                  pointerEvents: 'auto',
+                  alignSelf: 'flex-end',
+                  minHeight: '44px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  boxSizing: 'border-box',
+                  padding: '10px 22px',
+                  background: '#e85d04',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: 'var(--radius-soft)',
+                  fontFamily: 'var(--font-display)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  fontWeight: 700,
+                  fontSize: '14px',
+                  boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+                  cursor: 'pointer'
+                }}
+              >
+                Recenter
+              </button>
+            )}
 
             {tripStats && (
             <div
