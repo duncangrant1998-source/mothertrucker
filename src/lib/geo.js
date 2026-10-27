@@ -83,6 +83,30 @@ export const destPoint = (origin, bearingDeg, meters) => {
 // invite someone to "fix" it back.
 export const cameraHeadingForTravel = (travelHeadingDeg) => normalizeDegrees(travelHeadingDeg + 180);
 
+// Where a vehicle has most likely got to since its last GPS fix, by advancing
+// that fix along its own heading at its own measured speed.
+//
+// GPS arrives at about 1Hz. Following each fix as a stationary target makes
+// every fix a step change, and the display surges on the fix then coasts to a
+// near stop before the next one — on a motorway at constant speed that
+// measured as a 1.0s sawtooth with a 220:1 swing between fastest and slowest
+// frame. The fix rate is not what makes that choppy; treating a moving
+// vehicle as a sequence of stationary points is.
+//
+// `maxAgeMs` is the limit on extrapolation: past it the point stops advancing,
+// so a dropped signal parks the vehicle rather than flying it down the road on
+// a stale velocity. `minSpeedMps` suppresses it entirely at a standstill,
+// where GPS noise would otherwise creep the map around.
+export const deadReckonedPoint = (fix, nowMs, { maxAgeMs, minSpeedMps }) => {
+  const here = { lat: fix.lat, lng: fix.lng };
+  const speed = fix.speedMps ?? 0;
+  if (!Number.isFinite(speed) || speed < minSpeedMps) return here;
+  const ageMs = Math.min(maxAgeMs, Math.max(0, nowMs - fix.atMs));
+  const ahead = speed * (ageMs / 1000);
+  if (!(ahead > 0) || !Number.isFinite(fix.heading)) return here;
+  return destPoint(here, fix.heading, ahead);
+};
+
 // Local equirectangular projection to metres, centred on `refLat`. Over the
 // hundreds of metres a single route segment spans, the error against a proper
 // geodesic is well under a metre — far below the 50m reroute threshold these

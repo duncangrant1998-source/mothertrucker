@@ -6,6 +6,7 @@ import { PROVINCE_PERMITS, getProvincesForBounds } from '../lib/provincePermits'
 import {
   bearingDegrees,
   cameraHeadingForTravel,
+  deadReckonedPoint,
   destPoint,
   deriveTargetHeading,
   haversineMeters,
@@ -97,6 +98,15 @@ const MIN_HEADING_SPEED_MPS = 5 / 3.6;
 // the marker and camera exponentially approach the latest fix every frame with
 // this time constant. Steady-state lag is about TAU x speed: ~9m at 110 km/h.
 const NAV_FOLLOW_TAU_MS = 300;
+// Dead reckoning: how far past the last fix the displayed position may be
+// extrapolated before it stops and waits. Three seconds is long enough to
+// ride out a skipped fix and short enough that a lost signal parks the truck
+// rather than flying it down the road on a stale velocity.
+const NAV_DEAD_RECKON_MAX_MS = 3000;
+// Below this the vehicle is treated as stopped and nothing is extrapolated —
+// otherwise GPS noise at a standstill would creep the map around and defeat
+// the dead band.
+const NAV_DEAD_RECKON_MIN_MPS = 1;
 // Below these, the follow loop leaves the scene alone entirely rather than
 // reissuing a camera and marker update the viewer could not see anyway. The
 // point is to give the renderer idle frames in which to finish drawing the
@@ -2158,9 +2168,28 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         // progressively further behind the truth. Lag is bounded at roughly
         // TAU x speed — about 9m at 110 km/h, a fifth of the truck's own
         // length on screen at NAV_ZOOM.
+        // Dead reckoning. Fixes arrive at 1Hz, and easing toward each one as a
+        // static point makes every fix a step change: the map surged on the
+        // fix and coasted to a near stop before the next, measured at 121 km/h
+        // as a 1.0s sawtooth running 19 down to 0.1 — a 220:1 swing in a
+        // vehicle travelling at a dead constant speed. The input rate is not
+        // the problem; treating a moving truck as a sequence of stationary
+        // targets is.
+        //
+        // The aim point is therefore the last fix advanced along its own
+        // heading at its own measured speed for however long ago it arrived.
+        // At constant speed that advances linearly, so the follow tracks a
+        // smoothly moving target and each new fix becomes a small correction
+        // instead of a step. The exponential approach stays on top of it to
+        // absorb fix noise and the correction itself.
+        const aim = deadReckonedPoint(target, Date.now(), {
+          maxAgeMs: NAV_DEAD_RECKON_MAX_MS,
+          minSpeedMps: NAV_DEAD_RECKON_MIN_MPS
+        });
+
         const k = 1 - Math.exp(-dt / NAV_FOLLOW_TAU_MS);
-        const lat = pose.lat + (target.lat - pose.lat) * k;
-        const lng = pose.lng + (target.lng - pose.lng) * k;
+        const lat = pose.lat + (aim.lat - pose.lat) * k;
+        const lng = pose.lng + (aim.lng - pose.lng) * k;
         const heading = normalizeDegrees(pose.heading + shortestAngleDelta(pose.heading, target.heading) * k);
 
         // Dead band. An exponential approach is asymptotic: it never actually
@@ -2508,7 +2537,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // The follow loop converges on this target every frame; it is not a
     // fixed-duration animation with a start anchor, so there is nothing here
     // to restart or to fall behind.
-    navTargetRef.current = { lat: latitude, lng: longitude, heading: targetHeading };
+    // speedMps and atMs are what let the follow loop dead-reckon between
+    // fixes instead of easing toward a stationary point; estimatedSpeedMps
+    // already falls back to distance over time where the device does not
+    // report coords.speed.
+    navTargetRef.current = {
+      lat: latitude,
+      lng: longitude,
+      heading: targetHeading,
+      speedMps: estimatedSpeedMps ?? 0,
+      atMs: Date.now()
+    };
     if (isFirstFix) {
       // Nothing rendered yet to follow from — paint the first fix immediately.
       // Contained: this used to sit directly in the handler's path, so a throw

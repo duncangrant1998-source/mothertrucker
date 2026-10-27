@@ -3,6 +3,7 @@ import {
   bearingDegrees,
   buildCumulativeDistances,
   cameraHeadingForTravel,
+  deadReckonedPoint,
   destPoint,
   deriveTargetHeading,
   haversineMeters,
@@ -116,6 +117,55 @@ describe('cameraHeadingForTravel', () => {
     for (const h of [0, 37, 90, 180, 271, 359]) {
       expect(cameraHeadingForTravel(cameraHeadingForTravel(h))).toBeCloseTo(h, 6);
     }
+  });
+});
+
+describe('deadReckonedPoint', () => {
+  const opts = { maxAgeMs: 3000, minSpeedMps: 1 };
+  // 30 m/s due east, fix taken at t=1000.
+  const fix = { lat: 43.2, lng: -79.6, heading: 90, speedMps: 30, atMs: 1000 };
+
+  it('advances along the heading in proportion to elapsed time', () => {
+    const half = deadReckonedPoint(fix, 1500, opts);
+    const full = deadReckonedPoint(fix, 2000, opts);
+    expect(haversineMeters(fix, half)).toBeCloseTo(15, 0);
+    expect(haversineMeters(fix, full)).toBeCloseTo(30, 0);
+    expect(bearingDegrees(fix, full)).toBeCloseTo(90, 1);
+  });
+
+  // The whole point: between fixes the aim point must move at a constant
+  // rate, so the follow tracks a smoothly moving target rather than easing
+  // toward a stationary one and stalling.
+  it('advances at a constant rate across the interval', () => {
+    const steps = [0, 200, 400, 600, 800, 1000].map(
+      (ms) => haversineMeters(fix, deadReckonedPoint(fix, 1000 + ms, opts))
+    );
+    const deltas = steps.slice(1).map((d, i) => d - steps[i]);
+    for (const d of deltas) expect(d).toBeCloseTo(6, 0);
+  });
+
+  it('stops extrapolating once the fix goes stale', () => {
+    const capped = haversineMeters(fix, deadReckonedPoint(fix, 1000 + 3000, opts));
+    const wayLater = haversineMeters(fix, deadReckonedPoint(fix, 1000 + 60000, opts));
+    expect(capped).toBeCloseTo(90, 0);
+    expect(wayLater).toBeCloseTo(90, 0);
+  });
+
+  it('does not creep while stopped', () => {
+    const stopped = { ...fix, speedMps: 0.4 };
+    const p = deadReckonedPoint(stopped, 1000 + 2000, opts);
+    expect(haversineMeters(stopped, p)).toBeCloseTo(0, 5);
+  });
+
+  it('holds position for a fix from the future or with a bad heading', () => {
+    expect(haversineMeters(fix, deadReckonedPoint(fix, 500, opts))).toBeCloseTo(0, 5);
+    const noHeading = { ...fix, heading: NaN };
+    expect(haversineMeters(fix, deadReckonedPoint(noHeading, 2000, opts))).toBeCloseTo(0, 5);
+  });
+
+  it('survives a missing speed', () => {
+    const noSpeed = { lat: 43.2, lng: -79.6, heading: 90, atMs: 1000 };
+    expect(haversineMeters(noSpeed, deadReckonedPoint(noSpeed, 2000, opts))).toBeCloseTo(0, 5);
   });
 });
 
