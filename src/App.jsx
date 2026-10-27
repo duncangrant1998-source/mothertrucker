@@ -8,7 +8,6 @@ import MapLayerToggle from './components/MapLayerToggle';
 import GridOverlayToggle from './components/GridOverlayToggle';
 import ColorSchemeToggle from './components/ColorSchemeToggle';
 import Auth from './Auth';
-import LayoutDebug from './components/LayoutDebug';
 import ResetPassword from './ResetPassword';
 
 function App() {
@@ -158,7 +157,6 @@ function App() {
           )}
         </>
       )}
-      <LayoutDebug />
     </div>
   );
 }
