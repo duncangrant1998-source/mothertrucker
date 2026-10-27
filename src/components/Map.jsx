@@ -845,8 +845,22 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const [saveRouteName, setSaveRouteName] = useState('');
   const [savingRoute, setSavingRoute] = useState(false);
   const [saveRouteError, setSaveRouteError] = useState('');
+  // Collapses the route search card down to a small "Find Route" pill —
+  // manually via its own collapse button, or automatically on tapping the
+  // map itself (see the map 'tap' listener below, which only collapses
+  // while there's nothing worth keeping the full card open for: no route
+  // calculated yet and nothing in flight). Read inside that listener via
+  // routeCardCanAutoCollapseRef below rather than this state directly,
+  // since the listener is registered once on mount and would otherwise
+  // close over a stale value.
+  const [routeCardCollapsed, setRouteCardCollapsed] = useState(false);
+  const routeCardCanAutoCollapseRef = useRef(true);
 
   const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
+
+  useEffect(() => {
+    routeCardCanAutoCollapseRef.current = routeOptions.length === 0 && !searching;
+  }, [routeOptions.length, searching]);
 
   useEffect(() => {
     if (!mapInstance.current && mapRef.current) {
@@ -913,6 +927,17 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         if (bubbleRef.current && !isStationMarker) {
           uiRef.current.removeBubble(bubbleRef.current);
           bubbleRef.current = null;
+        }
+        // Tapping the map itself (never reached for taps on the route card,
+        // since it's a higher z-index DOM sibling) collapses the route
+        // search card down to its "Find Route" pill — but only while
+        // there's nothing in it worth keeping open: no calculated route and
+        // nothing in flight (routeCardCanAutoCollapseRef, kept current by
+        // the effect above since this listener is registered once on
+        // mount). Once a route exists, tapping the map to look around
+        // leaves the card (and its results) exactly as the driver left it.
+        if (routeCardCanAutoCollapseRef.current) {
+          setRouteCardCollapsed(true);
         }
       });
 
@@ -2858,6 +2883,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <style>{`
         @media (max-width: 480px) {
+          .mt-route-pill {
+            left: 16px !important;
+            top: calc(16px + env(safe-area-inset-top)) !important;
+          }
           .mt-route-card {
             /* Corner-anchored at the same 16px margin (plus the top safe-area
                inset, clearing the status bar/notch/Dynamic Island) as the
@@ -3390,7 +3419,38 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           )}
         </>
       )}
-      {!navigating && (
+      {!navigating && routeCardCollapsed && (
+        <button
+          onClick={() => setRouteCardCollapsed(false)}
+          className="mt-route-pill"
+          style={{
+            position: 'absolute',
+            top: 'calc(20px + env(safe-area-inset-top))',
+            left: 20,
+            zIndex: 2000,
+            minHeight: '44px',
+            boxSizing: 'border-box',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '10px 22px',
+            background: '#e85d04',
+            color: 'white',
+            border: 'none',
+            borderRadius: 'var(--radius-soft)',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+            cursor: 'pointer',
+            fontFamily: 'var(--font-display)',
+            fontSize: '14px',
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+            fontWeight: 700
+          }}
+        >
+          Find Route
+        </button>
+      )}
+      {!navigating && !routeCardCollapsed && (
       <div
         className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
         style={{
@@ -3420,7 +3480,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         }}
       >
         <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>
-        <div ref={routeDropdownRef} style={{ position: 'relative', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+        <div ref={routeDropdownRef} style={{ position: 'relative', flex: 1 }}>
           <button
             onClick={() => setShowRouteDropdown((open) => !open)}
             style={{
@@ -3523,6 +3584,31 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               )}
             </div>
           )}
+        </div>
+        <button
+          onClick={() => setRouteCardCollapsed(true)}
+          aria-label="Collapse route search"
+          title="Collapse"
+          style={{
+            width: '44px',
+            height: '44px',
+            flexShrink: 0,
+            boxSizing: 'border-box',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            border: '1px solid var(--color-border)',
+            background: 'var(--color-bg)',
+            color: 'var(--color-text-primary)',
+            fontSize: '18px',
+            lineHeight: 1,
+            fontWeight: 700,
+            cursor: 'pointer',
+            borderRadius: 'var(--radius-soft)'
+          }}
+        >
+          &#8722;
+        </button>
         </div>
 
         <div ref={startWrapperRef} style={{ position: 'relative', marginBottom: '8px' }}>

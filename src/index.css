@@ -12,12 +12,17 @@
    position: fixed + inset: 0 (not just overflow: hidden) because older
    WebKit's overscroll-behavior support is inconsistent in standalone/
    home-screen PWA mode, which is this app's primary target — fixed+inset is
-   the belt-and-suspenders version that also works there. */
+   the belt-and-suspenders version that also works there.
+   No explicit width/height here, deliberately — `inset: 0` on its own
+   already stretches a fixed box to the full viewport on every edge. Adding
+   `width: 100%; height: 100%` over-constrains the box (both a size AND all
+   four insets specified at once), which made the browser fall back to
+   resolving the percentage against the layout viewport instead of the
+   actual visual one, leaving a black strip of real device screen uncovered
+   at the bottom in standalone/home-screen mode. */
 html, body {
   position: fixed;
   inset: 0;
-  width: 100%;
-  height: 100%;
   margin: 0;
   overflow: hidden;
   overscroll-behavior: none;
@@ -27,8 +32,6 @@ html, body {
 #root {
   position: fixed;
   inset: 0;
-  width: 100%;
-  height: 100%;
   overflow: hidden;
   overscroll-behavior: none;
 }
