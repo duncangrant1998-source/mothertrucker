@@ -204,7 +204,7 @@ const VehicleProfile = ({ onProfileUpdate }) => {
       </button>
 
       <div style={{ display: 'grid', gridTemplateRows: expanded ? '1fr' : '0fr', transition: 'grid-template-rows 200ms ease-out' }}>
-        <div style={{ overflow: 'hidden', minHeight: 0 }}>
+        <div style={{ overflow: 'hidden', minHeight: 0, padding: '4px', margin: '-4px' }}>
           {DIMENSION_FIELDS.map(field => (
             <div key={field.name} style={{ marginBottom: '10px' }}>
               <label style={LABEL_STYLE}>

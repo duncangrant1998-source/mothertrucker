@@ -3542,7 +3542,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             compresses (and then scrolls, via overflowY) once real content
             — the route-options list — needs more room than max-height
             allows. */}
-        <div style={{ flex: '0 1 auto', minHeight: 0, overflowY: 'auto' }}>
+        <div style={{ flex: '0 1 auto', minHeight: 0, overflowY: 'auto', padding: '4px', margin: '-4px' }}>
         <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
         <div ref={routeDropdownRef} style={{ position: 'relative', flex: 1 }}>
           <button
