@@ -674,6 +674,24 @@ const DRIVER_ICON_SVG =
     '<line x1="21" y1="32" x2="35" y2="32" stroke="#fff" stroke-width="1.4" opacity="0.6"/>' +
   '</svg>';
 
+// Outside navigation the map is a plain north-up map with the driver's own
+// position marked. IDLE_ZOOM is where it first centres on them; the Recenter
+// button appears once the marker is more than this many pixels from the middle
+// of the screen.
+const IDLE_ZOOM = 13;
+const IDLE_RECENTER_THRESHOLD_PX = 60;
+
+const isOffCenter = (map, pos) => {
+  try {
+    const point = map.geoToScreen(pos);
+    const viewPort = map.getViewPort();
+    if (!point || !viewPort) return false;
+    return Math.hypot(point.x - viewPort.width / 2, point.y - viewPort.height / 2) > IDLE_RECENTER_THRESHOLD_PX;
+  } catch {
+    return false;
+  }
+};
+
 // Lazy rather than module-level: `H` is a global from index.html's script
 // tags, and this keeps icon construction inside the component lifecycle where
 // a failure is catchable, rather than at import time.
@@ -865,6 +883,11 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const [navDetached, setNavDetached] = useState(false);
   const navDetachedRef = useRef(false);
   const navActiveRef = useRef(false);
+  // Not navigating: where the driver is (idleWatch effect below), and whether
+  // the map has been moved far enough from them to offer Recenter.
+  const [idleAway, setIdleAway] = useState(false);
+  const idlePosRef = useRef(null);
+  const idleCenteredRef = useRef(false);
 
   const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
 
@@ -957,6 +980,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         if (!navActiveRef.current || navDetachedRef.current) return;
         navDetachedRef.current = true;
         setNavDetached(true);
+      });
+
+      map.addEventListener('mapviewchangeend', () => {
+        const pos = idlePosRef.current;
+        if (!pos || navActiveRef.current) return;
+        setIdleAway(isOffCenter(map, pos));
       });
 
     }
@@ -1304,6 +1333,49 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
     return () => { cancelled = true; };
   }, []);
+
+  // Marks the driver's own position on the map whenever navigation isn't
+  // running (navigation draws its own marker, so this one is removed while it
+  // runs and comes back when it stops), centres the map on them the first time
+  // a fix arrives, and tracks whether they've since been panned out of the
+  // middle so the Recenter button can show. The first-fix centring is skipped
+  // if a route is already being worked on, so it can't yank the map out from
+  // under a preview. A denied or unavailable permission just means no marker.
+  useEffect(() => {
+    if (navigating || !navigator.geolocation) return;
+    let marker = null;
+
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const map = mapInstance.current;
+        if (!map) return;
+        const pos = { lat: position.coords.latitude, lng: position.coords.longitude };
+        idlePosRef.current = pos;
+        driverPositionRef.current = pos;
+        if (!marker) {
+          marker = new H.map.Marker(pos, { icon: getDriverIcon() });
+          map.addObject(marker);
+        } else {
+          marker.setGeometry(pos);
+        }
+        if (!idleCenteredRef.current && routeCardCanAutoCollapseRef.current) {
+          idleCenteredRef.current = true;
+          map.getViewModel().setLookAtData({ position: pos, zoom: IDLE_ZOOM });
+        } else {
+          setIdleAway(isOffCenter(map, pos));
+        }
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 }
+    );
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId);
+      if (marker && mapInstance.current) mapInstance.current.removeObject(marker);
+      idlePosRef.current = null;
+      setIdleAway(false);
+    };
+  }, [navigating]);
 
   // Re-checks the driver's country every few minutes while navigating so
   // auto-detect can flip units on a cross-border trip without polling constantly.
@@ -2817,6 +2889,16 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     startNavAnimationLoop();
   };
 
+  // Not-navigating Recenter: back to the driver, keeping the current zoom
+  // unless the map is zoomed out past IDLE_ZOOM.
+  const recenterOnDriver = () => {
+    const map = mapInstance.current;
+    const pos = idlePosRef.current;
+    if (!map || !pos) return;
+    map.getViewModel().setLookAtData({ position: pos, zoom: Math.max(map.getZoom(), IDLE_ZOOM) });
+    setIdleAway(false);
+  };
+
   // Hands the camera back to the follow loop and snaps it to the truck now,
   // at the navigation zoom/heading/tilt (the engine eases there).
   const recenterNavCamera = () => {
@@ -4122,6 +4204,37 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         </div>
           )}
         </div>
+      )}
+      {!navigating && idleAway && (
+        <button
+          onClick={recenterOnDriver}
+          style={{
+            position: 'absolute',
+            right: '16px',
+            // Clears HERE's attribution strip along the very bottom edge.
+            bottom: 'calc(40px + env(safe-area-inset-bottom, 0px))',
+            zIndex: 1900,
+            minHeight: '44px',
+            boxSizing: 'border-box',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '10px 22px',
+            background: '#e85d04',
+            color: 'white',
+            border: 'none',
+            borderRadius: 'var(--radius-soft)',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+            cursor: 'pointer',
+            fontFamily: 'var(--font-display)',
+            fontSize: '14px',
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+            fontWeight: 700
+          }}
+        >
+          Recenter
+        </button>
       )}
       <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
       {gridOverlay === 'on' && <div className="mt-grid-overlay" />}
