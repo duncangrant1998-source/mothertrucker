@@ -144,15 +144,20 @@ export default function MenuDrawer({ children }) {
             style={{
               width: '44px',
               height: '44px',
+              flexShrink: 0,
+              boxSizing: 'border-box',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               borderRadius: 'var(--radius-soft)',
-              border: 'none',
-              background: 'transparent',
-              fontSize: '24px',
+              // Same bordered-chip chrome as the route card's collapse
+              // ("−") button, rather than a bare borderless glyph.
+              border: '1px solid var(--color-border)',
+              background: 'var(--color-bg)',
+              fontSize: '20px',
+              fontWeight: 700,
               lineHeight: 1,
-              color: 'var(--color-text-muted)',
+              color: 'var(--color-text-primary)',
               cursor: 'pointer'
             }}
           >

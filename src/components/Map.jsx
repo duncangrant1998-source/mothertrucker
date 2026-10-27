@@ -3479,7 +3479,18 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           '--card-max-height': routeCardMaxHeight != null ? `${routeCardMaxHeight}px` : undefined
         }}
       >
-        <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>
+        {/* flex-grow: 0 — this region should hug its own content height
+            (dropdown + inputs, or that plus the route-options list once a
+            route exists), never stretch to fill whatever leftover space the
+            card's max-height constraint happens to leave. flex-grow: 1 here
+            previously meant the body expanded to the full available height
+            any time there was nothing below it to also claim space (i.e.
+            before a route is calculated), leaving a large empty gap under
+            the Find Truck Route button. flex-shrink stays 1 so it still
+            compresses (and then scrolls, via overflowY) once real content
+            — the route-options list — needs more room than max-height
+            allows. */}
+        <div style={{ flex: '0 1 auto', minHeight: 0, overflowY: 'auto' }}>
         <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
         <div ref={routeDropdownRef} style={{ position: 'relative', flex: 1 }}>
           <button

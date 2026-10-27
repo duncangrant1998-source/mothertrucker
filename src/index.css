@@ -9,20 +9,18 @@
    overscroll on any drag, even inside it — drags/rubber-bands the whole
    page, and the fixed-position UI (route card, hamburger button, etc.)
    visibly detaches from the screen edges while that happens.
-   position: fixed + inset: 0 (not just overflow: hidden) because older
-   WebKit's overscroll-behavior support is inconsistent in standalone/
-   home-screen PWA mode, which is this app's primary target — fixed+inset is
-   the belt-and-suspenders version that also works there.
-   No explicit width/height here, deliberately — `inset: 0` on its own
-   already stretches a fixed box to the full viewport on every edge. Adding
-   `width: 100%; height: 100%` over-constrains the box (both a size AND all
-   four insets specified at once), which made the browser fall back to
-   resolving the percentage against the layout viewport instead of the
-   actual visual one, leaving a black strip of real device screen uncovered
-   at the bottom in standalone/home-screen mode. */
+   Only #root — an ordinary div, not the document root elements — actually
+   gets `position: fixed; inset: 0`. html and body stay in normal flow
+   (height: 100%, no position change) and only block their OWN scrolling;
+   #root is what's truly pinned to the real visual viewport. Making html
+   and body themselves position: fixed (tried first, still left a black
+   strip of real device screen uncovered at the bottom in standalone/
+   home-screen mode) is an unusual enough pattern that WebKit's layout for
+   it in standalone PWA mode can't be relied on — `position: fixed; inset: 0`
+   on a plain div is the far more common, better-tested path to "pinned to
+   the visual viewport", so that's what actually owns the sizing. */
 html, body {
-  position: fixed;
-  inset: 0;
+  height: 100%;
   margin: 0;
   overflow: hidden;
   overscroll-behavior: none;
