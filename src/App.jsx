@@ -8,6 +8,7 @@ import MapLayerToggle from './components/MapLayerToggle';
 import GridOverlayToggle from './components/GridOverlayToggle';
 import ColorSchemeToggle from './components/ColorSchemeToggle';
 import Auth from './Auth';
+import LayoutDebug from './components/LayoutDebug';
 import ResetPassword from './ResetPassword';
 
 function App() {
@@ -66,6 +67,18 @@ function App() {
     const scheme = showingAuthScreen ? 'dark' : effectiveColorScheme;
     if (meta) meta.setAttribute('content', scheme === 'dark' ? '#1F2327' : '#e85d04');
   }, [effectiveColorScheme, showingAuthScreen]);
+
+  // Blocks iOS's native pinch-zoom of the whole page. The map's own pinch zoom
+  // is driven by touch events, not gesture events, so it is unaffected.
+  useEffect(() => {
+    const block = (e) => e.preventDefault();
+    document.addEventListener('gesturestart', block);
+    document.addEventListener('gesturechange', block);
+    return () => {
+      document.removeEventListener('gesturestart', block);
+      document.removeEventListener('gesturechange', block);
+    };
+  }, []);
 
   useEffect(() => {
     // Tagging every Sentry event with the Supabase user id is what makes a
@@ -126,10 +139,7 @@ function App() {
   if (loading) return <div>Loading...</div>;
 
   return (
-    // Fills the pinned #root (see index.css) exactly — 100% of its fixed,
-    // inset:0 parent — rather than 100vw/100vh, which can measure larger
-    // than the visible viewport (scrollbar gutters, iOS's dynamic toolbar)
-    // and reintroduce the very page-level scroll/bounce index.css pins away.
+    // Fills #root (100vh, see index.css) exactly.
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       {passwordRecovery ? (
         <ResetPassword onDone={() => setPasswordRecovery(false)} />
@@ -148,6 +158,7 @@ function App() {
           )}
         </>
       )}
+      <LayoutDebug />
     </div>
   );
 }

@@ -42,14 +42,12 @@ export default function MenuDrawer({ children }) {
         .mt-close-btn:hover { background: var(--color-bg); color: var(--color-text-primary); }
         .mt-signout-btn:hover:not(:disabled) { background: var(--color-bg); }
         @media (max-width: 480px) {
-          .mt-hamburger {
-            top: calc(12px + env(safe-area-inset-top)) !important;
-          }
+          /* Top offset stays at the base 16px (+ safe-area inset) for both the
+             hamburger and the drawer, matching the route card's top on the
+             left so the two menus sit level. */
           .mt-drawer {
             left: 12px !important;
             right: calc(12px + env(safe-area-inset-right)) !important;
-            top: calc(12px + env(safe-area-inset-top)) !important;
-            max-height: calc(100vh - 24px - env(safe-area-inset-top)) !important;
             width: auto !important;
             max-width: none !important;
           }

@@ -1,45 +1,32 @@
 @import "tailwindcss";
 @import "./styles/tokens.css";
 
-/* App-shell lockdown — makes the installed (home-screen) app behave like a
-   native app instead of a web page: the page itself never pans, bounces or
-   pinch-zooms, only the HERE map canvas does (it handles its own gestures).
-   Without this, html/body are implicitly scrollable at their natural
-   (content) size, so a drag that starts outside the map — or iOS's elastic
-   overscroll on any drag, even inside it — drags/rubber-bands the whole
-   page, and the fixed-position UI (route card, hamburger button, etc.)
-   visibly detaches from the screen edges while that happens.
-   Only #root — an ordinary div, not the document root elements — actually
-   gets `position: fixed; inset: 0`. html and body stay in normal flow
-   (height: 100%, no position change) and only block their OWN scrolling;
-   #root is what's truly pinned to the real visual viewport. Making html
-   and body themselves position: fixed (tried first, still left a black
-   strip of real device screen uncovered at the bottom in standalone/
-   home-screen mode) is an unusual enough pattern that WebKit's layout for
-   it in standalone PWA mode can't be relied on — `position: fixed; inset: 0`
-   on a plain div is the far more common, better-tested path to "pinned to
-   the visual viewport", so that's what actually owns the sizing. */
+/* App-shell lockdown — the page itself should never pan or bounce, only the
+   HERE map canvas does (it handles its own gestures).
+   Deliberately NOT position: fixed on #root, html or body, and no height on
+   html/body. The installed iPhone app showed a ~59px black strip at the
+   bottom with every position: fixed / inset / percent-height variant (fixed
+   html+body, fixed #root with inset: 0, fixed #root with 100vh), while the
+   original normal-flow 100vh layout filled the screen — so #root stays an
+   ordinary block exactly 100vh tall, and scroll/bounce is blocked on the
+   document instead: overflow hidden on html (which propagates to the
+   viewport rather than clipping body to its own box) plus overscroll-
+   behavior: none to stop iOS's elastic bounce. */
 html, body {
-  height: 100%;
   margin: 0;
-  overflow: hidden;
   overscroll-behavior: none;
   -webkit-text-size-adjust: 100%;
 }
 
-/* Height is 100vh, not inset: 0 / 100%. On the installed iPhone app the
-   layout viewport that fixed positioning and percentages resolve against
-   comes out about one status-bar-inset (~59px) shorter than the screen, which
-   left a black strip at the bottom — three attempts with inset/percent sizing
-   all showed it. 100vh is what the app used before the lockdown and it filled
-   the screen, so #root is still pinned (position: fixed, top/left 0) but
-   sized with vh. */
+html {
+  overflow: hidden;
+}
+
 #root {
-  position: fixed;
-  top: 0;
-  left: 0;
+  position: relative;
   width: 100%;
   height: 100vh;
   overflow: hidden;
   overscroll-behavior: none;
+  touch-action: manipulation;
 }
