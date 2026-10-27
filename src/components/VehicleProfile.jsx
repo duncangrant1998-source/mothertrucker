@@ -186,20 +186,21 @@ const VehicleProfile = ({ onProfileUpdate }) => {
           width: '100%',
           minHeight: '44px',
           boxSizing: 'border-box',
-          marginBottom: '12px',
-          padding: 0,
-          border: 'none',
-          background: 'transparent',
+          // Same chip as the route card's "Select Previous Route" row.
+          marginBottom: expanded ? '10px' : 0,
+          padding: '8px 10px',
+          background: 'var(--color-bg)',
+          border: '1px solid var(--color-border)',
+          borderRadius: 'var(--radius-soft)',
           cursor: 'pointer',
-          fontFamily: 'var(--font-display)'
+          fontFamily: 'var(--font-display)',
+          fontSize: '13px',
+          fontWeight: 600,
+          color: 'var(--color-text-primary)'
         }}
       >
-        <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--color-text-muted)' }}>
-          Vehicle Profile
-        </span>
-        <span style={{ fontSize: '10px', color: 'var(--color-text-muted)' }}>
-          {expanded ? '▲' : '▼'}
-        </span>
+        <span>Vehicle Profile</span>
+        <span>{expanded ? '▲' : '▼'}</span>
       </button>
 
       <div style={{ display: 'grid', gridTemplateRows: expanded ? '1fr' : '0fr', transition: 'grid-template-rows 200ms ease-out' }}>

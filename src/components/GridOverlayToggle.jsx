@@ -29,7 +29,7 @@ const segmentStyle = (active) => ({
 // Sits next to MapLayerToggle in the drawer, styled identically.
 export default function GridOverlayToggle({ value, onChange }) {
   return (
-    <div style={{ marginTop: '16px' }}>
+    <div style={{ marginTop: '10px' }}>
       <label style={{ ...LABEL_STYLE, display: 'block', marginBottom: '8px' }}>
         Grid Overlay
       </label>

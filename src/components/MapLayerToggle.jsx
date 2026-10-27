@@ -31,7 +31,7 @@ const segmentStyle = (active) => ({
 // inside VehicleProfile, since this is an app-level display preference.
 export default function MapLayerToggle({ value, onChange }) {
   return (
-    <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--color-border)' }}>
+    <div style={{ marginTop: '10px' }}>
       <label style={{ ...LABEL_STYLE, display: 'block', marginBottom: '8px' }}>
         Map Display
       </label>

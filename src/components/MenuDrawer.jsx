@@ -7,15 +7,6 @@ import { supabase } from '../lib/supabase'
 // matching Map.jsx/VehicleProfile.jsx/Auth.jsx. A tiny scoped <style> block
 // covers the couple of hover states inline styles can't express.
 
-const LABEL_STYLE = {
-  fontFamily: 'var(--font-display)',
-  fontSize: '11px',
-  fontWeight: 600,
-  textTransform: 'uppercase',
-  letterSpacing: '0.08em',
-  color: 'var(--color-text-muted)'
-}
-
 export default function MenuDrawer({ children }) {
   const [open, setOpen] = useState(false)
   const [email, setEmail] = useState('')
@@ -125,8 +116,12 @@ export default function MenuDrawer({ children }) {
           flexDirection: 'column',
           background: 'var(--color-panel)',
           borderRadius: 'var(--radius-soft)',
-          borderLeft: '1px solid var(--color-border)',
-          boxShadow: '-4px 0 24px rgba(0,0,0,0.25)',
+          // Same panel chrome as the route card on the left: full 1px border,
+          // 16px uniform padding, and the same soft drop shadow.
+          border: '1px solid var(--color-border)',
+          padding: '16px',
+          boxSizing: 'border-box',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
           fontFamily: 'var(--font-display)',
           transition: 'transform 200ms ease-out',
           // translateX(100%) alone only clears the drawer's own width — the
@@ -135,8 +130,26 @@ export default function MenuDrawer({ children }) {
           transform: open ? 'translateX(0)' : 'translateX(calc(100% + 40px))'
         }}
       >
-        <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--color-border)', padding: '16px 20px' }}>
-          <h2 style={LABEL_STYLE}>Menu</h2>
+        <header style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+          <h2
+            style={{
+              flex: 1,
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              padding: '8px 10px',
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 'var(--radius-soft)',
+              fontFamily: 'var(--font-display)',
+              fontSize: '13px',
+              fontWeight: 600,
+              color: 'var(--color-text-primary)'
+            }}
+          >
+            Menu
+          </h2>
           <button
             onClick={() => setOpen(false)}
             aria-label="Close menu"
@@ -165,14 +178,14 @@ export default function MenuDrawer({ children }) {
           </button>
         </header>
 
-        <div style={{ padding: '16px 20px', color: 'var(--color-text-primary)' }}>
+        <div style={{ color: 'var(--color-text-primary)' }}>
           {/* Vehicle Profile drops in here */}
           {children}
         </div>
 
-        <footer style={{ borderTop: '1px solid var(--color-border)', padding: '16px 20px' }}>
+        <footer style={{ marginTop: '10px' }}>
           {email && (
-            <p style={{ marginBottom: '12px', fontSize: '11px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={email}>
+            <p style={{ marginBottom: '8px', fontSize: '11px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={email}>
               Signed in as <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--color-text-primary)' }}>{email}</span>
             </p>
           )}

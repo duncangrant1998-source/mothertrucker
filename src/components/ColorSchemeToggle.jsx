@@ -32,7 +32,7 @@ const segmentStyle = (active) => ({
 // always accurate even before the user has picked one explicitly.
 export default function ColorSchemeToggle({ value, onChange }) {
   return (
-    <div style={{ marginTop: '16px' }}>
+    <div style={{ marginTop: '10px' }}>
       <label style={{ ...LABEL_STYLE, display: 'block', marginBottom: '8px' }}>
         Color Scheme
       </label>

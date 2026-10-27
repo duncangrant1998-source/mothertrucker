@@ -27,9 +27,19 @@ html, body {
   -webkit-text-size-adjust: 100%;
 }
 
+/* Height is 100vh, not inset: 0 / 100%. On the installed iPhone app the
+   layout viewport that fixed positioning and percentages resolve against
+   comes out about one status-bar-inset (~59px) shorter than the screen, which
+   left a black strip at the bottom — three attempts with inset/percent sizing
+   all showed it. 100vh is what the app used before the lockdown and it filled
+   the screen, so #root is still pinned (position: fixed, top/left 0) but
+   sized with vh. */
 #root {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100vh;
   overflow: hidden;
   overscroll-behavior: none;
 }

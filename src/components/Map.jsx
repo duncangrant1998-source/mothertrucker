@@ -3819,13 +3819,16 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           style={{
             // Pinned action area — never shrinks, never scrolls, so the
             // primary action can't be pushed out of view no matter how
-            // little room the card has. paddingBottom clears the
-            // home-indicator/gesture area on notched phones.
+            // little room the card has. No bottom safe-area padding here:
+            // the card floats from the top and its max-height already stops
+            // short of the home-indicator area, so adding env(safe-area-
+            // inset-bottom) only left a ~34px dead strip under the last
+            // button on notched phones (invisible on desktop, where the
+            // inset is 0), making the card's bottom gap larger than its top.
             flex: '0 0 auto',
             borderTop: routeOptions.length > 0 ? '1px solid var(--color-border)' : 'none',
             marginTop: routeOptions.length > 0 ? '10px' : 0,
-            paddingTop: routeOptions.length > 0 ? '10px' : 0,
-            paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+            paddingTop: routeOptions.length > 0 ? '10px' : 0
           }}
         >
         {routeOptions.length > 0 && (
