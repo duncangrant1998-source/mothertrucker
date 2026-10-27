@@ -3,12 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <!-- No maximum-scale / user-scalable here: iOS ignores them anyway, and
-         they were the only window-level change still in place while the
-         installed app showed a black strip at the bottom. Page pinch-zoom is
-         blocked in App.jsx (gesturestart) and double-tap zoom in index.css
-         (touch-action: manipulation) instead; the map does its own zoom. -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- maximum-scale=1 is what stops iOS zooming the whole page in when an
+         input under 16px is focused (the route card's inputs are 14px, a
+         1.14x zoom) and then leaving it zoomed. Without it, typing an end
+         location leaves the layout oversized and cut off, and the gesture
+         block in App.jsx stops you pinching back out. It was NOT the cause
+         of the black strip at the bottom (that was percent/fixed heights, see
+         index.css). The map does its own pinch zoom. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Mother Trucker</title>
 
     <!-- PWA: installable, opens standalone (no browser chrome) from the home
