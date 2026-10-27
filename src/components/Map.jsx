@@ -557,7 +557,7 @@ const MENU_ITEM_STYLE = {
 };
 
 // Shared "Industrial Precision" primitives: all-caps muted micro-labels,
-// monospace data readouts, and flat bordered panels with sharp (<=2px) corners.
+// monospace data readouts, and bordered panels with the app's soft rounded corners.
 const LABEL_STYLE = {
   fontFamily: 'var(--font-display)',
   fontSize: '10px',
@@ -575,7 +575,7 @@ const MONO_STYLE = {
 const PANEL_STYLE = {
   background: 'var(--color-panel)',
   border: '1px solid var(--color-border)',
-  borderRadius: 0,
+  borderRadius: 'var(--radius-soft)',
   color: 'var(--color-text-primary)',
   fontFamily: 'var(--font-display)'
 };
@@ -3011,9 +3011,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           <div
             style={{
               position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
+              // Same 16px (+ safe-area inset) margins as the route card and
+              // hamburger, so the banner is a rounded bubble like them
+              // rather than a bar spanning the whole top of the screen.
+              top: 'calc(16px + env(safe-area-inset-top))',
+              left: '16px',
+              right: '16px',
               zIndex: 2500,
               display: 'flex',
               flexDirection: 'column'
@@ -3025,11 +3028,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 alignItems: 'flex-start',
                 gap: '12px',
                 ...PANEL_STYLE,
-                borderTop: 'none',
-                borderLeft: 'none',
-                borderRight: 'none',
-                borderBottom: '1px solid var(--color-border)',
-                padding: 'calc(14px + env(safe-area-inset-top)) 16px 16px 20px'
+                padding: '16px',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.25)'
               }}
             >
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -3210,7 +3210,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 style={{
                   alignSelf: 'flex-start',
                   marginTop: '8px',
-                  marginLeft: '16px',
                   maxWidth: '280px',
                   background: STATION_ALERT_STYLE.background,
                   color: STATION_ALERT_STYLE.color,
@@ -3228,7 +3227,6 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 style={{
                   alignSelf: 'flex-start',
                   marginTop: '8px',
-                  marginLeft: '16px',
                   maxWidth: '280px',
                   background: 'var(--color-panel)',
                   color: 'var(--color-text-primary)',
