@@ -2541,12 +2541,25 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     // fixes instead of easing toward a stationary point; estimatedSpeedMps
     // already falls back to distance over time where the device does not
     // report coords.speed.
+    //
+    // atMs is when the fix was *taken*, not when we got round to handling it.
+    // Those differ: watchPosition runs with maximumAge 2000, which explicitly
+    // permits the browser to hand back a position up to two seconds old, and
+    // there is delivery latency on top. Dating the fix from handling time
+    // throws that interval away and under-extrapolates by exactly as much as
+    // the fix was stale — up to 66m at 120 km/h, which is most of the
+    // correction the dead reckoning exists to make.
+    //
+    // Same epoch as Date.now(), which is how fixAge is computed above. A
+    // future-dated timestamp from a skewed device clock floors the age at 0
+    // and simply disables extrapolation; a wildly old one is capped by
+    // NAV_DEAD_RECKON_MAX_MS. Both fail safe.
     navTargetRef.current = {
       lat: latitude,
       lng: longitude,
       heading: targetHeading,
       speedMps: estimatedSpeedMps ?? 0,
-      atMs: Date.now()
+      atMs: position.timestamp
     };
     if (isFirstFix) {
       // Nothing rendered yet to follow from — paint the first fix immediately.
