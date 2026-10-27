@@ -855,6 +855,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // close over a stale value.
   const [routeCardCollapsed, setRouteCardCollapsed] = useState(false);
   const routeCardCanAutoCollapseRef = useRef(true);
+  // Area Regulations (province permit cards) start closed; the pill toggles them.
+  const [permitPanelOpen, setPermitPanelOpen] = useState(false);
 
   const effectiveSpeedUnit = speedUnit === 'auto' ? autoUnit : speedUnit;
 
@@ -2919,6 +2921,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             max-height: min(calc(100vh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom, 0px)), var(--card-max-height, 100vh)) !important;
             overflow: hidden !important;
           }
+          .mt-route-card.mt-has-permit-pill {
+            /* Only the 44px Area Regulations pill sits below the card while the
+               permit cards are closed: 16px top + 20px bottom offsets, the pill,
+               and a 12px gap, plus both safe-area insets. */
+            max-height: min(calc(100vh - 92px - env(safe-area-inset-top) - env(safe-area-inset-bottom, 0px)), var(--card-max-height, 100vh)) !important;
+          }
           .mt-route-card.mt-has-permits {
             /* Leaves room below for the bottom-anchored permit strip so the
                two never overlap. The strip occupies at most its own 230px
@@ -2935,6 +2943,9 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           .mt-permit-panel {
             left: 12px !important;
             right: 12px !important;
+          }
+          .mt-permit-pill {
+            margin-left: 4px;
           }
           .mt-trip-stats {
             flex-wrap: wrap;
@@ -3452,7 +3463,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       )}
       {!navigating && !routeCardCollapsed && (
       <div
-        className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
+        className={`mt-route-card${provincesOnRoute.length > 0 ? (permitPanelOpen ? ' mt-has-permits' : ' mt-has-permit-pill') : ''}`}
         style={{
           position: 'absolute',
           // env(safe-area-inset-top) clears the status bar / notch / Dynamic
@@ -3947,12 +3958,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           style={{
             position: 'absolute',
             // env(safe-area-inset-bottom) clears the home-indicator/gesture
-            // area on notched phones; permitPanelMaxHeight (VisualViewport-
-            // aware, see useAvailableViewportHeight) additionally shrinks
-            // the panel — and each card below, individually — when Safari's
-            // collapsible bottom bar is actually showing and eating into
-            // the visible height, rather than assuming the full static
-            // 230px is always available.
+            // area on notched phones.
             bottom: 'calc(20px + env(safe-area-inset-bottom, 0px))',
             left: '20px',
             right: '20px',
@@ -3960,8 +3966,52 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             // "Find Truck Route" button stay tappable if the two ever touch.
             zIndex: 1900,
             display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'flex-start',
+            gap: '8px',
+            // Only the pill and the cards take taps, so the empty strip
+            // beside them doesn't block dragging the map.
+            pointerEvents: 'none'
+          }}
+        >
+          <button
+            onClick={() => setPermitPanelOpen((open) => !open)}
+            className="mt-permit-pill"
+            aria-expanded={permitPanelOpen}
+            style={{
+              pointerEvents: 'auto',
+              minHeight: '44px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '10px',
+              padding: '10px 22px',
+              background: '#e85d04',
+              color: 'white',
+              border: 'none',
+              borderRadius: 'var(--radius-soft)',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+              cursor: 'pointer',
+              fontFamily: 'var(--font-display)',
+              fontSize: '14px',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              fontWeight: 700
+            }}
+          >
+            Area Regulations
+            {permitPanelOpen && <span aria-hidden="true">&#8722;</span>}
+          </button>
+          {permitPanelOpen && (
+        <div
+          style={{
+            pointerEvents: 'auto',
+            display: 'flex',
             gap: '12px',
-            maxHeight: `${permitPanelMaxHeight}px`,
+            width: '100%',
+            // permitPanelMaxHeight less the 44px pill and 8px gap above.
+            maxHeight: `${Math.max(permitPanelMaxHeight - 52, 120)}px`,
             overflowX: 'auto',
             overflowY: 'auto',
             paddingBottom: '4px'
@@ -3981,7 +4031,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   fontFamily: 'var(--font-display)',
                   boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
                   boxSizing: 'border-box',
-                  maxHeight: `${permitPanelMaxHeight}px`,
+                  maxHeight: `${Math.max(permitPanelMaxHeight - 52, 120)}px`,
                   overflowY: 'auto'
                 }}
               >
@@ -4028,6 +4078,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               </div>
             );
           })}
+        </div>
+          )}
         </div>
       )}
       <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
