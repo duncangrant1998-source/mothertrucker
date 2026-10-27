@@ -880,11 +880,16 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       platformRef.current = platform;
       uiRef.current = ui;
 
-      // Move the layer swatch, zoom buttons, and scale bar to bottom-left so
-      // they stay clear of the trip stats panel docked bottom-right.
+      // Hide HERE's default UI chrome entirely — the layer swatch, zoom
+      // +/- buttons, and scale bar all duplicate controls this app already
+      // provides itself (MapLayerToggle in the drawer; pinch/double-tap for
+      // zoom), and left on they read as stray "web map" widgets rather than
+      // part of this app's own design, plus the zoom buttons don't collapse
+      // to safe-area-aware positioning on small screens the way this app's
+      // own UI does.
       ['mapsettings', 'zoom', 'scalebar'].forEach((controlName) => {
         const control = ui.getControl(controlName);
-        if (control) control.setAlignment(H.ui.LayoutAlignment.LEFT_BOTTOM);
+        if (control) control.setVisibility(false);
       });
 
       weighIconRef.current = new H.map.Icon(
@@ -2854,18 +2859,21 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       <style>{`
         @media (max-width: 480px) {
           .mt-route-card {
-            /* Corner-anchored at the same 16px margin as the hamburger
-               drawer (MenuDrawer.jsx), not a large fixed top offset — this
-               card and the hamburger button occupy the same row across the
-               top of the screen, so width is capped to leave the button's
-               56px + 16px margin + a 16px gap clear on the right rather than
-               reaching under it (16 possible px of card margin already
-               spoken for on the left, hence the 104px reservation: 56 + 16
-               + 16 + 16). max-height mirrors the drawer's own
-               calc(100vh - 32px) (16px margin top and bottom) now that top
-               starts at 16px instead of 84px. */
+            /* Corner-anchored at the same 16px margin (plus the top safe-area
+               inset, clearing the status bar/notch/Dynamic Island) as the
+               hamburger drawer (MenuDrawer.jsx), not a large fixed top
+               offset — this card and the hamburger button occupy the same
+               row across the top of the screen, so width is capped to leave
+               the button's 56px + 16px margin + a 16px gap clear on the
+               right rather than reaching under it (16 possible px of card
+               margin already spoken for on the left, hence the 104px
+               reservation: 56 + 16 + 16 + 16). max-height mirrors the
+               drawer's own calc(100vh - 32px - inset-top) (16px margin top
+               and bottom, plus the same top safe-area reservation as the
+               card's own top offset) now that top starts at 16px instead of
+               84px. */
             left: 16px !important;
-            top: 16px !important;
+            top: calc(16px + env(safe-area-inset-top)) !important;
             width: min(320px, calc(100vw - 104px)) !important;
             /* min() of a safe-area-aware CSS fallback and --card-max-height
                (this component's own VisualViewport measurement, set as an
@@ -2879,21 +2887,21 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                size and only the route-options list in between scrolls, so
                the Save/Start buttons below it can never be the thing that
                gets clipped. */
-            max-height: min(calc(100vh - 32px - env(safe-area-inset-bottom, 0px)), var(--card-max-height, 100vh)) !important;
+            max-height: min(calc(100vh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom, 0px)), var(--card-max-height, 100vh)) !important;
             overflow: hidden !important;
           }
           .mt-route-card.mt-has-permits {
             /* Leaves room below for the bottom-anchored permit strip so the
                two never overlap. The strip occupies at most its own 230px
                plus its 20px bottom offset and the safe-area inset; the card
-               starts 16px from the top and keeps a 12px gap above the strip
-               — 278px total, not the 354px this previously reserved. That
-               over-reservation cost the card 76px it did not need to give
-               up, which is what tipped the options list into collapsing.
-               The floor is high enough to still fit the pinned action area
-               plus a scrollable row, rather than the old 160px which could
-               not. */
-            max-height: min(max(280px, calc(100vh - 278px - env(safe-area-inset-bottom, 0px))), var(--card-max-height, 100vh)) !important;
+               starts 16px (plus the top safe-area inset) from the top and
+               keeps a 12px gap above the strip — 278px total, not the 354px
+               this previously reserved. That over-reservation cost the card
+               76px it did not need to give up, which is what tipped the
+               options list into collapsing. The floor is high enough to
+               still fit the pinned action area plus a scrollable row, rather
+               than the old 160px which could not. */
+            max-height: min(max(280px, calc(100vh - 278px - env(safe-area-inset-top) - env(safe-area-inset-bottom, 0px))), var(--card-max-height, 100vh)) !important;
           }
           .mt-permit-panel {
             left: 12px !important;
@@ -3020,7 +3028,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
-                      borderRadius: 0,
+                      borderRadius: 'var(--radius-soft)',
                       border: '1px solid var(--color-border)',
                       background: 'var(--color-panel)',
                       color: 'var(--color-text-primary)',
@@ -3042,7 +3050,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                         width: '210px',
                         background: 'var(--color-panel)',
                         border: '1px solid var(--color-border)',
-                        borderRadius: 0,
+                        borderRadius: 'var(--radius-soft)',
                         boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
                         overflow: 'hidden'
                       }}
@@ -3087,6 +3095,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 <div
                   style={{
                     ...PANEL_STYLE,
+                    borderRadius: 'var(--radius-soft)',
                     borderLeft: '3px solid var(--color-route-normal)',
                     padding: '8px 14px',
                     textAlign: 'center',
@@ -3265,7 +3274,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 background: '#dc2626',
                 color: 'white',
                 border: 'none',
-                borderRadius: 0,
+                borderRadius: 'var(--radius-soft)',
                 fontFamily: 'var(--font-display)',
                 textTransform: 'uppercase',
                 letterSpacing: '0.05em',
@@ -3342,7 +3351,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 </div>
                 <button
                   onClick={() => setShowProfileModal(false)}
-                  style={{ marginTop: '16px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
+                  style={{ marginTop: '16px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: '#e85d04', color: 'white', border: 'none', borderRadius: 'var(--radius-soft)', cursor: 'pointer', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Close
                 </button>
@@ -3366,13 +3375,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   href={PROVINCE_PERMITS.Ontario.portalUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '44px', boxSizing: 'border-box', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: 0, textDecoration: 'none', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '44px', boxSizing: 'border-box', textAlign: 'center', marginTop: '12px', padding: '8px', background: '#e85d04', color: 'white', borderRadius: 'var(--radius-soft)', textDecoration: 'none', fontFamily: 'var(--font-display)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}
                 >
                   Open Permit Portal
                 </a>
                 <button
                   onClick={() => setShowMtoContactModal(false)}
-                  style={{ marginTop: '10px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
+                  style={{ marginTop: '10px', width: '100%', minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
                 >
                   Close
                 </button>
@@ -3386,7 +3395,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         className={`mt-route-card${provincesOnRoute.length > 0 ? ' mt-has-permits' : ''}`}
         style={{
           position: 'absolute',
-          top: 20,
+          // env(safe-area-inset-top) clears the status bar / notch / Dynamic
+          // Island on phones (defaults to 0 where unsupported, so this never
+          // regresses on desktop/older browsers).
+          top: 'calc(20px + env(safe-area-inset-top))',
           left: 20,
           zIndex: 2000,
           ...PANEL_STYLE,
@@ -3569,7 +3581,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             background: searching ? '#aaa' : '#e85d04',
             color: 'white',
             border: 'none',
-            borderRadius: 0,
+            borderRadius: 'var(--radius-soft)',
             cursor: searching ? 'not-allowed' : 'pointer',
             fontFamily: 'var(--font-display)',
             textTransform: 'uppercase',
@@ -3610,7 +3622,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   flex: '0 0 auto',
                   boxSizing: 'border-box',
                   padding: '8px 12px',
-                  borderRadius: 0,
+                  borderRadius: 'var(--radius-soft)',
                   border: '1px solid var(--color-border)',
                   // 4px on BOTH states (transparent when unselected) rather
                   // than 3px-vs-1px, so switching selection can't shift the
@@ -3733,7 +3745,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               background: 'var(--color-route-normal)',
               color: 'white',
               border: 'none',
-              borderRadius: 0,
+              borderRadius: 'var(--radius-soft)',
               cursor: 'pointer',
               fontFamily: 'var(--font-display)',
               textTransform: 'uppercase',
@@ -3761,7 +3773,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               background: 'transparent',
               color: 'var(--color-text-muted)',
               border: 'none',
-              borderRadius: 0,
+              borderRadius: 'var(--radius-soft)',
               cursor: 'pointer',
               fontFamily: 'var(--font-display)',
               textTransform: 'uppercase',
@@ -3789,7 +3801,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
               value={saveRouteName}
               onChange={(e) => setSaveRouteName(e.target.value)}
               autoFocus
-              style={{ width: '100%', minHeight: '44px', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 0, boxSizing: 'border-box', marginBottom: '10px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
+              style={{ width: '100%', minHeight: '44px', padding: '8px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', boxSizing: 'border-box', marginBottom: '10px', background: 'var(--color-panel)', color: 'var(--color-text-primary)', fontFamily: 'var(--font-display)' }}
             />
             {saveRouteError && (
               <div style={{ color: '#c0392b', fontFamily: 'var(--font-display)', fontSize: '12px', marginBottom: '8px' }}>{saveRouteError}</div>
@@ -3797,7 +3809,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
             <div style={{ display: 'flex', gap: '8px' }}>
               <button
                 onClick={() => setShowSaveRouteModal(false)}
-                style={{ flex: 1, minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 0, cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
+                style={{ flex: 1, minHeight: '44px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-soft)', cursor: 'pointer', fontFamily: 'var(--font-display)', color: 'var(--color-text-primary)' }}
               >
                 Cancel
               </button>
@@ -3815,7 +3827,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   background: savingRoute ? '#aaa' : 'var(--color-route-normal)',
                   color: 'white',
                   border: 'none',
-                  borderRadius: 0,
+                  borderRadius: 'var(--radius-soft)',
                   cursor: savingRoute ? 'not-allowed' : 'pointer',
                   fontFamily: 'var(--font-display)',
                   textTransform: 'uppercase',
@@ -3864,7 +3876,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                   flex: '0 0 240px',
                   background: permit.color,
                   color: 'white',
-                  borderRadius: 0,
+                  borderRadius: 'var(--radius-soft)',
                   padding: '14px',
                   fontFamily: 'var(--font-display)',
                   boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
@@ -3902,7 +3914,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                     boxSizing: 'border-box',
                     padding: '8px',
                     background: 'rgba(255,255,255,0.2)',
-                    borderRadius: 0,
+                    borderRadius: 'var(--radius-soft)',
                     color: 'white',
                     fontWeight: 700,
                     textTransform: 'uppercase',

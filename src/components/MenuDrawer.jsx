@@ -51,10 +51,14 @@ export default function MenuDrawer({ children }) {
         .mt-close-btn:hover { background: var(--color-bg); color: var(--color-text-primary); }
         .mt-signout-btn:hover:not(:disabled) { background: var(--color-bg); }
         @media (max-width: 480px) {
+          .mt-hamburger {
+            top: calc(12px + env(safe-area-inset-top)) !important;
+          }
           .mt-drawer {
             left: 12px !important;
             right: calc(12px + env(safe-area-inset-right)) !important;
-            top: 12px !important;
+            top: calc(12px + env(safe-area-inset-top)) !important;
+            max-height: calc(100vh - 24px - env(safe-area-inset-top)) !important;
             width: auto !important;
             max-width: none !important;
           }
@@ -72,7 +76,9 @@ export default function MenuDrawer({ children }) {
         className="mt-hamburger"
         style={{
           position: 'fixed',
-          top: '16px',
+          // env(safe-area-inset-top) clears the status bar / notch / Dynamic
+          // Island on phones (defaults to 0 where unsupported).
+          top: 'calc(16px + env(safe-area-inset-top))',
           right: 'calc(16px + env(safe-area-inset-right))',
           zIndex: 4000,
           width: '56px',
@@ -107,12 +113,12 @@ export default function MenuDrawer({ children }) {
         className="mt-drawer"
         style={{
           position: 'fixed',
-          top: '16px',
+          top: 'calc(16px + env(safe-area-inset-top))',
           right: 'calc(16px + env(safe-area-inset-right))',
           zIndex: 4002,
           display: 'flex',
           height: 'auto',
-          maxHeight: 'calc(100vh - 32px)',
+          maxHeight: 'calc(100vh - 32px - env(safe-area-inset-top))',
           overflowY: 'auto',
           width: '340px',
           maxWidth: '85vw',
@@ -141,7 +147,7 @@ export default function MenuDrawer({ children }) {
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              borderRadius: 0,
+              borderRadius: 'var(--radius-soft)',
               border: 'none',
               background: 'transparent',
               fontSize: '24px',
@@ -176,7 +182,7 @@ export default function MenuDrawer({ children }) {
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              borderRadius: 0,
+              borderRadius: 'var(--radius-soft)',
               border: '1px solid var(--color-border)',
               padding: '10px 16px',
               fontFamily: 'var(--font-display)',

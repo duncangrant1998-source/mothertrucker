@@ -3,7 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- maximum-scale=1, user-scalable=no: this is an installed app whose
+         own map does its own pinch-zoom — without this, iOS/Android let you
+         pinch-zoom and double-tap-zoom the whole page (the "web page", not
+         the map), which is exactly the broken, non-native feel reported in
+         testing: the page's outline stops tracking the screen and you can
+         drag/zoom the background instead of the map. See index.css for the
+         matching position:fixed/overscroll-behavior lockdown on html/body. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Mother Trucker</title>
 
     <!-- PWA: installable, opens standalone (no browser chrome) from the home

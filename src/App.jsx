@@ -126,7 +126,11 @@ function App() {
   if (loading) return <div>Loading...</div>;
 
   return (
-    <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
+    // Fills the pinned #root (see index.css) exactly — 100% of its fixed,
+    // inset:0 parent — rather than 100vw/100vh, which can measure larger
+    // than the visible viewport (scrollbar gutters, iOS's dynamic toolbar)
+    // and reintroduce the very page-level scroll/bounce index.css pins away.
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       {passwordRecovery ? (
         <ResetPassword onDone={() => setPasswordRecovery(false)} />
       ) : !user ? (
