@@ -150,18 +150,18 @@ export default function MenuDrawer({ children }) {
               alignItems: 'center',
               justifyContent: 'center',
               borderRadius: 'var(--radius-soft)',
-              // Same bordered-chip chrome as the route card's collapse
-              // ("−") button, rather than a bare borderless glyph.
+              // Same bordered-chip chrome AND glyph as the route card's
+              // collapse ("−") button, rather than a borderless "×".
               border: '1px solid var(--color-border)',
               background: 'var(--color-bg)',
-              fontSize: '20px',
+              fontSize: '18px',
               fontWeight: 700,
               lineHeight: 1,
               color: 'var(--color-text-primary)',
               cursor: 'pointer'
             }}
           >
-            &times;
+            &#8722;
           </button>
         </header>
 
