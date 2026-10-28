@@ -1840,6 +1840,23 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       weighMarkersRef.current = [];
       inspectionMarkersRef.current = [];
       setInspectionStationCount(0);
+      // This wipe is wholesale — it also rips out a driver marker and nav
+      // polyline left over from a navigation session that wasn't cleanly
+      // stopped first. Those refs weren't touched, so they still point at
+      // objects that are no longer on the map. renderDriverPose only ever
+      // re-adds the marker when the ref is null (`if (!driverMarkerRef.current)`);
+      // otherwise it just calls setGeometry() on it — a valid call on a
+      // detached object, so it throws nothing and updates nothing visible.
+      // That silently produced a marker that reports MRK 1, ICON READY, and
+      // a correct on-screen position in the debug overlay while never
+      // painting, because it was never actually in the map's object
+      // collection for this session. Null the refs here so the next
+      // navigation start recreates and re-adds them for real.
+      if (driverMarkerRef.current) {
+        driverMarkerRef.current = null;
+        navIconWasLoadingRef.current = false;
+      }
+      navPolylineRef.current = null;
 
       const options = validResults.map(({ config, route }) => {
         const section = route.sections[0];
