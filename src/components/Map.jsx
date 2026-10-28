@@ -70,10 +70,18 @@ const getSatelliteLayers = (defaultLayers, colorScheme) => (
 const NAV_ZOOM = 18;
 const NAV_TILT = 45;
 // Distance at which route-derived heading is no longer trusted (falls back
-// to GPS-fix-to-fix bearing) — deliberately looser than REROUTE_TRIGGER_METERS
-// below, since "is this still a decent proxy for my heading" is a lower bar
-// than "request a whole new route."
-const OFF_ROUTE_METERS = 100;
+// to GPS-fix-to-fix bearing). This used to be a looser 100m — deliberately
+// wider than REROUTE_TRIGGER_METERS below, on the theory that "still a
+// decent proxy for my heading" is a lower bar than "request a whole new
+// route." In practice that let the two thresholds disagree: in the 50-100m
+// band the app was already counting fixes toward a reroute (confirmed
+// diverging) while still pointing the truck marker along the *original*
+// route's bearing instead of the way it was actually facing — road-tested
+// as the marker holding the intended route's direction through a turn into
+// a lot, a wrong-way start, or a parallel street. Tightened to match the
+// reroute trigger: a fix too far off-route to still count as "on the
+// route" for rerouting purposes is too far off to trust its bearing either.
+const OFF_ROUTE_METERS = 50;
 
 // Automatic-reroute trigger: a single fix past this distance from the route
 // polyline only starts counting toward confirmation — it takes
@@ -2350,9 +2358,27 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           minSpeedMps: NAV_DEAD_RECKON_MIN_MPS
         });
 
+        // GPS jitter while essentially stationary otherwise reads as the
+        // truck crawling around a parked spot: consumer GPS accuracy is
+        // commonly 3-8m, an order of magnitude above NAV_FOLLOW_MIN_MOVE_M
+        // below, so a fix that hasn't actually moved still clears that dead
+        // band and gets eased toward every ~1s — road-tested as choppy,
+        // directionless twitching while parked. Below the dead-reckoning
+        // stopped-speed threshold, only chase a new fix once it lands
+        // further from the displayed position than its own reported GPS
+        // accuracy (clamped to a sane range for a missing/wild reading);
+        // within that, hold still instead of animating toward noise.
+        let aimPoint = aim;
+        if (target.speedMps < NAV_DEAD_RECKON_MIN_MPS) {
+          const noiseFloorM = Math.min(20, Math.max(4, target.accuracy ?? 6));
+          if (haversineMeters(pose, aim) < noiseFloorM) {
+            aimPoint = pose;
+          }
+        }
+
         const k = 1 - Math.exp(-dt / NAV_FOLLOW_TAU_MS);
-        const lat = pose.lat + (aim.lat - pose.lat) * k;
-        const lng = pose.lng + (aim.lng - pose.lng) * k;
+        const lat = pose.lat + (aimPoint.lat - pose.lat) * k;
+        const lng = pose.lng + (aimPoint.lng - pose.lng) * k;
         const heading = normalizeDegrees(pose.heading + shortestAngleDelta(pose.heading, target.heading) * k);
 
         // Dead band. An exponential approach is asymptotic: it never actually
@@ -2545,13 +2571,28 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     updateStationsForRoute(polyline.getBoundingBox());
   };
 
-  const recalculateFromCurrentPosition = async (lat, lng) => {
+  const recalculateFromCurrentPosition = async (lat, lng, headingDeg) => {
     try {
       const destination = routeEndRef.current;
       if (!destination || !platformRef.current) return;
       const router = platformRef.current.getRoutingService(null, 8);
+      // Bare lat/lng tells the routing engine where the truck is, not which
+      // way it's facing — so when it's off-route, the "fastest" path back to
+      // the destination from that point is frequently a U-turn straight back
+      // onto the original route. Observed on a road test as "the reroute is
+      // always the same route" even while driving further from it: the new
+      // route was technically different, but its first leg doubled back the
+      // way the driver had come, which from a few fixes later looked
+      // identical to never having rerouted at all. `course` tells the engine
+      // the direction of travel so it can route onward from there instead;
+      // `minCourseDistance` keeps it from immediately turning at the very
+      // next junction once it's gotten the truck pointed the right way. See
+      // https://docs.here.com/routing/docs/routing-v8-gps-waypoints
+      const origin = Number.isFinite(headingDeg)
+        ? `${lat},${lng};course=${Math.round(normalizeDegrees(headingDeg))};minCourseDistance=50`
+        : `${lat},${lng}`;
       const rerouteParams = {
-        origin: `${lat},${lng}`,
+        origin,
         destination: `${destination.lat},${destination.lng}`,
         transportMode: 'truck',
         routingMode: 'fast',
@@ -2756,7 +2797,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       lng: longitude,
       heading: targetHeading,
       speedMps: estimatedSpeedMps ?? 0,
-      atMs: position.timestamp
+      atMs: position.timestamp,
+      accuracy: Number.isFinite(accuracy) ? accuracy : null
     };
     if (isFirstFix) {
       // Nothing rendered yet to follow from — paint the first fix immediately.
@@ -2805,7 +2847,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         navRerouteCountRef.current += 1;
         navRerouteStatusRef.current = 'run';
         setRecalculating(true);
-        recalculateFromCurrentPosition(latitude, longitude).finally(() => {
+        recalculateFromCurrentPosition(latitude, longitude, smoothedHeadingRef.current).finally(() => {
           recalculatingRef.current = false;
         });
       }
