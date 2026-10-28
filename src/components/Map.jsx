@@ -1371,7 +1371,22 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
     return () => {
       navigator.geolocation.clearWatch(watchId);
-      if (marker && mapInstance.current) mapInstance.current.removeObject(marker);
+      // calculateRoute wipes every object off the map on a fresh route search
+      // (mapInstance.current.removeObjects(mapInstance.current.getObjects())),
+      // which silently orphans this marker without this effect finding out —
+      // it keeps the reference, unaware the SDK no longer considers it part of
+      // the map. The HERE SDK throws if you ask it to remove an object that
+      // isn't currently in its collection, and since this runs inside an
+      // effect cleanup (triggered the instant Start Route flips `navigating`
+      // to true), that throw happens during React's commit phase, where
+      // Sentry's error boundary catches it — crashing the whole app right as
+      // navigation starts. Same defensive pattern as isOffCenter above: this
+      // call is a best-effort cleanup, never something worth crashing over.
+      try {
+        if (marker && mapInstance.current) mapInstance.current.removeObject(marker);
+      } catch (err) {
+        console.warn('[idle-marker] removeObject failed — likely already removed from the map', err);
+      }
       idlePosRef.current = null;
       setIdleAway(false);
     };
