@@ -2862,7 +2862,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       mapInstance.current.removeObjects(routeEndpointMarkersRef.current);
       routeEndpointMarkersRef.current = [];
     }
-    applyNavRoute(selected.section);
+    // applyNavRoute throws when the selected route's response has no usable
+    // geometry (see decodeSectionGeometry). The reroute path already catches
+    // this and shows a toast instead of crashing; this entry point is the
+    // Start Route button's onClick handler, so an uncaught throw here blows
+    // past React's render and trips the top-level error boundary — the whole
+    // app dies instead of surfacing a recoverable error.
+    try {
+      applyNavRoute(selected.section);
+    } catch (err) {
+      console.error('[nav] failed to start navigation — route has no usable geometry', err);
+      setError("Couldn't start navigation — this route came back without a map line. Try recalculating the route.");
+      return;
+    }
     navActiveRef.current = true;
     navDetachedRef.current = false;
     setNavDetached(false);
