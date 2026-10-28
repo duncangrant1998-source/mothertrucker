@@ -759,6 +759,10 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   const navLastFrameAtRef = useRef(0);
   const navWatchdogRef = useRef(null);
   const navWatchdogRestartsRef = useRef(0);
+  // Was the driver icon LOADING on the previous frame? Used to catch the
+  // LOADING -> READY transition exactly once — see the redraw-on-ready logic
+  // in stepNavAnimation.
+  const navIconWasLoadingRef = useRef(false);
   // TEMPORARY — see navDebugOverlayEnabled.
   const navDebugBoxRef = useRef(null);
   const navCameraReadbackAtRef = useRef(0);
@@ -2269,6 +2273,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       driverMarkerRef.current = new H.map.Marker(pos, { icon: getDriverIcon() });
       mapInstance.current.addObject(driverMarkerRef.current);
       navLog('driver marker created', pos);
+      // Treat a freshly created marker as "was loading" even if its icon
+      // (cached, so often already decoded by the time a second marker would
+      // need one) happens to read READY on the very next check — otherwise a
+      // same-frame or near-instant decode never registers as a LOADING ->
+      // READY transition in stepNavAnimation, and the forced redraw there
+      // never fires for this marker.
+      navIconWasLoadingRef.current = true;
     } else {
       driverMarkerRef.current.setGeometry(pos);
     }
@@ -2364,7 +2375,39 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           iconLoading = false;
         }
 
-        if (iconLoading || moved >= NAV_FOLLOW_MIN_MOVE_M || turned >= NAV_FOLLOW_MIN_TURN_DEG) {
+        // The comment above describes the failure but the "hold the loop
+        // open while LOADING" fix doesn't actually solve it when the vehicle
+        // is parked or barely moving: holding the loop open just means
+        // renderDriverPose calls setGeometry with the *same* lat/lng every
+        // frame, and the SDK does not appear to repaint an object layer for a
+        // position update that didn't change — so the marker sits in the
+        // object store, icon fully decoded, never actually drawn, and
+        // nothing afterwards ever invalidates that layer again. This was
+        // masked on every past test because the position genuinely changes
+        // every frame while driving, which does force a repaint; it reproduces
+        // every time the truck is stationary during the icon's decode window
+        // — i.e. exactly the parked road-test scenario this was found in.
+        //
+        // Fix: catch the LOADING -> not-LOADING transition explicitly and
+        // force a hard redraw right then, independent of whether the
+        // position moved. Removing and re-adding the marker is the one
+        // operation guaranteed to make the renderer treat it as new and draw
+        // it fresh with the now-ready bitmap.
+        const iconWasLoading = navIconWasLoadingRef.current;
+        navIconWasLoadingRef.current = iconLoading;
+        const iconJustSettled = iconWasLoading && !iconLoading;
+        if (iconJustSettled && driverMarkerRef.current && mapInstance.current) {
+          try {
+            const marker = driverMarkerRef.current;
+            mapInstance.current.removeObject(marker);
+            mapInstance.current.addObject(marker);
+            navLog('driver icon settled — forced marker redraw');
+          } catch (err) {
+            console.error('[nav] forced marker redraw FAILED', err);
+          }
+        }
+
+        if (iconLoading || iconJustSettled || moved >= NAV_FOLLOW_MIN_MOVE_M || turned >= NAV_FOLLOW_MIN_TURN_DEG) {
           // Marker and camera are driven from the same pose on the same frame.
           // They were briefly split — camera once per fix, marker per frame —
           // which stopped the camera lagging but left the map stepping once a
@@ -2976,6 +3019,7 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
       mapInstance.current.removeObject(driverMarkerRef.current);
       driverMarkerRef.current = null;
     }
+    navIconWasLoadingRef.current = false;
     if (navPolylineRef.current) {
       mapInstance.current.removeObject(navPolylineRef.current);
       navPolylineRef.current = null;
