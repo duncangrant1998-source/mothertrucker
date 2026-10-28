@@ -2896,6 +2896,19 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     setNavigating(true);
     onNavigatingChange?.(true);
 
+    // Without this the camera stays on the wide route-preview overview until
+    // the first live fix comes back through handlePositionUpdate — a cold
+    // GPS acquisition that can take several seconds, during which the app
+    // just looks stuck. driverPositionRef is usually already warm (the
+    // idle-tracking watch has been running the whole time the route sat in
+    // preview), so this is normally an instant, accurate snap to the close
+    // chase-cam view; routeStartRef is the fallback for the rare case
+    // geolocation hasn't resolved anything yet. The real fix still lands and
+    // takes over as soon as it arrives — this only removes the wait before
+    // the camera moves at all.
+    const initialNavPos = driverPositionRef.current || routeStartRef.current;
+    if (initialNavPos) updateNavCamera(initialNavPos.lat, initialNavPos.lng, smoothedHeadingRef.current);
+
     navLog('navigation STARTED', {
       routeId: selected.id,
       points: navRoutePointsRef.current?.length ?? 0,
