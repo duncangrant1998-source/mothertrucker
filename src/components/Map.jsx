@@ -132,6 +132,31 @@ const NAV_STALE_FIX_MS = 5000;
 // How often the camera is read back and the on-screen readout repainted.
 // Fast enough to look live, slow enough that the digits stay readable.
 const NAV_READBACK_MS = 200;
+// How often setLookAtData is actually called, as opposed to how often
+// stepNavAnimation runs (every animation frame, up to 60/s). Road-tested
+// with ?debug=1: the engine's own camera readback (getLookAtData) froze
+// solid mid-drive — not gradually losing ground, but a single instant after
+// which it never moved again — while setLookAtData kept being called every
+// frame with a fresh, correct position and never threw (navCameraErrorsRef
+// stayed 0 the whole time). camLagM (driver vs. the frozen readback) grew
+// exactly linearly at the vehicle's road speed from that instant forward —
+// 1m -> 186m -> 393m -> 1114m across the next 34s at ~115km/h — which is a
+// camera that stopped entirely, not one losing an animation race. The map
+// went solid black at the same moment and never recovered. There is no SDK
+// error or event here to catch; the only lever available from outside the
+// engine is how hard it's being driven. Sustained 60Hz setLookAtData calls
+// with a changing tilt+heading target is an unusual, demanding pattern for
+// this engine to sit in for minutes at a time, so throttling the call rate
+// is the most defensible mitigation available without SDK source access.
+const NAV_CAMERA_SET_MIN_MS = 100;
+// If the engine's own camera position (read back via getLookAtData, not
+// just "did setLookAtData throw") stays unmistakably behind the driver for
+// this long, treat it as the freeze above rather than ordinary catch-up
+// jitter, and surface the one recovery a wedged render engine actually
+// responds to: a reload. See the NAV_CAMERA_SET_MIN_MS comment for the
+// road-tested evidence this is based on.
+const NAV_CAMERA_STUCK_MS = 4000;
+const NAV_CAMERA_STUCK_METERS = 50;
 
 // --- navigation diagnostics -------------------------------------------
 // Field instrumentation for the in-vehicle camera/tracking failures. The
@@ -774,6 +799,13 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // TEMPORARY — see navDebugOverlayEnabled.
   const navDebugBoxRef = useRef(null);
   const navCameraReadbackAtRef = useRef(0);
+  // Last time setLookAtData was actually called (throttled separately from
+  // the readback above) — see NAV_CAMERA_SET_MIN_MS.
+  const navCameraSetAtRef = useRef(0);
+  // When the engine's camera first read back as unmistakably behind the
+  // driver (camLagM over NAV_CAMERA_STUCK_METERS), null while tracking is
+  // fine — see NAV_CAMERA_STUCK_MS and cameraFrozen below.
+  const navCameraStuckSinceRef = useRef(null);
   // H.map.Group holding the two bearing-probe markers ('N' due north, 'F'
   // dead ahead). Its own group so the probes can be cleared without touching
   // the truck marker or the route line.
@@ -851,6 +883,12 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
   // feedback shown once `recalculating` clears. 'success' auto-dismisses;
   // 'failed' stays up until the next attempt resolves one way or the other.
   const [rerouteNotice, setRerouteNotice] = useState(null);
+  // true once the engine's own camera has read back as stuck behind the
+  // driver for NAV_CAMERA_STUCK_MS straight — see updateNavCamera and the
+  // NAV_CAMERA_STUCK_MS comment. The surrounding UI (this banner included)
+  // keeps rendering fine through the freeze this is built to catch, which
+  // is what makes showing it here useful instead of moot.
+  const [cameraFrozen, setCameraFrozen] = useState(false);
   const [currentInstruction, setCurrentInstruction] = useState(null);
   const [nextInstruction, setNextInstruction] = useState(null);
   const [toastAlert, setToastAlert] = useState(null);
@@ -2201,12 +2239,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
     try {
       const viewModel = mapInstance.current.getViewModel();
-      viewModel.setLookAtData(lookAt);
+      const now = Date.now();
+      // Throttled independently of the readback below — see
+      // NAV_CAMERA_SET_MIN_MS. stepNavAnimation calls this every animation
+      // frame (up to 60/s); the engine only needs to hear about it this
+      // often to look smooth, and the road-tested freeze this guards
+      // against only ever showed up after minutes of the full-rate version.
+      if (now - navCameraSetAtRef.current >= NAV_CAMERA_SET_MIN_MS) {
+        navCameraSetAtRef.current = now;
+        viewModel.setLookAtData(lookAt);
+      }
 
       // Sampled rather than done per frame: the read-back and the projection
       // probes are wasted work 60 times a second, and a readout that changes
       // that fast is unreadable on a phone in a moving vehicle.
-      const now = Date.now();
       if (now - navCameraReadbackAtRef.current >= NAV_READBACK_MS) {
         navCameraReadbackAtRef.current = now;
         const model = viewModel.getLookAtData();
@@ -2261,6 +2307,23 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
           // visibly adrift even if it has not left the viewport yet.
           camTracking: camLagM != null && camLagM < 25
         };
+
+        // Self-detect the engine-internal camera freeze found during road
+        // testing: getLookAtData() stops moving entirely while setLookAtData
+        // keeps being called every frame without throwing. camLagM is the
+        // same lag metric that proved it (grew exactly linearly at road
+        // speed for 34s straight) — this runs in every build, not just
+        // ?debug=1, since nothing here is gated on the debug overlay.
+        if (camLagM != null && camLagM > NAV_CAMERA_STUCK_METERS) {
+          if (navCameraStuckSinceRef.current == null) {
+            navCameraStuckSinceRef.current = now;
+          } else if (now - navCameraStuckSinceRef.current >= NAV_CAMERA_STUCK_MS) {
+            setCameraFrozen(true);
+          }
+        } else {
+          navCameraStuckSinceRef.current = null;
+          setCameraFrozen(false);
+        }
 
         paintNavDebugOverlay({ travel: travelHeading, heading, tilt, zoom: NAV_ZOOM }, model, drawn, flags, now);
         updateNavDebugProbes(mapInstance.current, { lat, lng }, travelHeading);
@@ -3092,6 +3155,8 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     navTargetRef.current = null;
     navLastStepAtRef.current = 0;
     displayedPoseRef.current = null;
+    navCameraStuckSinceRef.current = null;
+    setCameraFrozen(false);
     if (driverMarkerRef.current) {
       mapInstance.current.removeObject(driverMarkerRef.current);
       driverMarkerRef.current = null;
@@ -3484,6 +3549,30 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
                 }}
               >
                 {rerouteNotice.text}
+              </div>
+            )}
+
+            {cameraFrozen && (
+              <div
+                onClick={() => window.location.reload()}
+                role="button"
+                style={{
+                  alignSelf: 'center',
+                  marginTop: '8px',
+                  background: '#dc2626',
+                  color: 'white',
+                  padding: '10px 16px',
+                  borderRadius: 'var(--radius-soft)',
+                  fontFamily: 'var(--font-display)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  fontSize: '13px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
+                }}
+              >
+                Map stuck — tap to reload
               </div>
             )}
 
