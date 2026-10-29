@@ -1162,7 +1162,20 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
     const el = mapRef.current;
     if (!map || !el) return;
 
+    // A black map that never comes back, road-tested after an extended
+    // highway drive with no reroute in flight, matches this: mid-transition
+    // (iOS Safari's chrome collapsing/expanding, an orientation flip, a
+    // keyboard or Dynamic Island animating) the container can report a
+    // transient zero or near-zero size. Resizing HERE's viewport to that
+    // degenerates its internal projection/canvas, and nothing here forces a
+    // second resize once the real size comes back a moment later — the one
+    // real resize that would have fixed it never fires because, as far as
+    // ResizeObserver/visualViewport are concerned, nothing changed. Guarding
+    // on a sane size can't make a genuine resize worse, so it's a safe
+    // addition regardless of whether this is the whole story.
     const resize = () => {
+      const rect = el.getBoundingClientRect();
+      if (!(rect.width > 1 && rect.height > 1)) return;
       try {
         map.getViewPort().resize();
       } catch (err) {
@@ -1172,18 +1185,23 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
 
     // ResizeObserver catches container-driven changes (drawer, orientation,
     // safe-area shifts); visualViewport catches the browser chrome sliding
-    // over the page without the element's own box changing.
+    // over the page without the element's own box changing. visibilitychange
+    // is a cheap extra nudge on foregrounding — costs nothing when the size
+    // didn't actually change, and is the one thing that can still recover a
+    // canvas stuck on a stale/zero size with no further resize event due.
     const observer = new ResizeObserver(resize);
     observer.observe(el);
     const vv = window.visualViewport;
     vv?.addEventListener('resize', resize);
     window.addEventListener('orientationchange', resize);
+    document.addEventListener('visibilitychange', resize);
     resize();
 
     return () => {
       observer.disconnect();
       vv?.removeEventListener('resize', resize);
       window.removeEventListener('orientationchange', resize);
+      document.removeEventListener('visibilitychange', resize);
     };
   }, []);
 
