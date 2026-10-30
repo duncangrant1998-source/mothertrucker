@@ -1038,6 +1038,51 @@ const MapView = ({ profile, mapLayer, gridOverlay, colorScheme, onNavigatingChan
         setIdleAway(isOffCenter(map, pos));
       });
 
+      // WebGL context loss — the likely actual root cause behind the
+      // black-screen/frozen-camera failure the camLag detection above was
+      // inferring after the fact. Both base layers this app uses
+      // (getTopoLayer, and the vector overlay half of getSatelliteLayers)
+      // are HERE's vector tiles, rendered through the bundled Tangram
+      // engine on WebGL — and the 3D tilt/heading nav camera only exists
+      // because of that engine. A WebGL context can be evicted by the
+      // browser under GPU memory pressure at any time, with nothing handed
+      // to JS to catch; iOS Safari does this more readily than desktop, and
+      // every road test so far has also been running the OS's own screen
+      // recorder throughout, which competes for the same GPU/encoder
+      // budget. When the browser does evict it, the canvas goes solid black
+      // immediately and silently — setLookAtData keeps "succeeding" into a
+      // context that can no longer draw. 'webglcontextlost' is the
+      // authoritative, instant version of that same event, so when it
+      // fires, skip the few-second camLag dwell in updateNavCamera
+      // entirely and raise the recovery banner right away. Tangram creates
+      // its canvas lazily (it doesn't exist the instant the map does), and
+      // nothing in the public API says how many canvases it ends up with,
+      // so this watches the whole container for any canvas appearing at
+      // any time rather than querying it once right here.
+      const glLossWatchedCanvases = new WeakSet();
+      const watchCanvasForContextLoss = (canvas) => {
+        if (glLossWatchedCanvases.has(canvas)) return;
+        glLossWatchedCanvases.add(canvas);
+        canvas.addEventListener('webglcontextlost', (evt) => {
+          // preventDefault is the browser's handshake for "don't tear this
+          // context down for good, I might try to use it again" — it's
+          // what makes 'webglcontextrestored' possible later. It does not,
+          // by itself, make Tangram redraw into the restored context, so
+          // this still routes to the same reload banner either way.
+          evt.preventDefault();
+          console.error('[nav] WebGL context lost — map canvas will stay black until reload', evt);
+          navCameraStuckSinceRef.current = Date.now();
+          setCameraFrozen(true);
+        });
+        canvas.addEventListener('webglcontextrestored', () => {
+          console.warn('[nav] WebGL context restored by the browser — Tangram still needs a reload to draw into it again');
+        });
+      };
+      Array.from(mapRef.current.querySelectorAll('canvas')).forEach(watchCanvasForContextLoss);
+      const canvasWatcher = new MutationObserver(() => {
+        Array.from(mapRef.current.querySelectorAll('canvas')).forEach(watchCanvasForContextLoss);
+      });
+      canvasWatcher.observe(mapRef.current, { childList: true, subtree: true });
     }
   }, []);
 
